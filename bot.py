@@ -9,7 +9,8 @@ from discord.ext import commands, tasks
 # SETTINGS
 # ==========================================
 TZ = ZoneInfo("Europe/Bratislava")
-MAX_SLOTS = 20
+MAX_SLOTS = 24
+BLOCKED_SLOTS = [1, 2]
 
 # Fixed ID/PW channel ID (int), or set it with !setidpchannel
 IDPW_CHANNEL_ID: int | None = None
