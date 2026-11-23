@@ -1,10 +1,11 @@
 import asyncio
 from datetime import datetime, time, timedelta, timezone
+import os
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import discord
 from discord.ext import commands
 
-TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"
+TOKEN = os.getenv("DISCORD_TOKEN", "PASTE_YOUR_BOT_TOKEN_HERE")
 PREFIX = "%"
 VIP_ROLE_NAME = "Vip_role"
 
@@ -13,7 +14,6 @@ def get_local_timezone():
     try:
         return ZoneInfo("Europe/Budapest")
     except ZoneInfoNotFoundError:
-        # Fallback if tzdata is not installed in the container (CET = UTC+1)
         return timezone(timedelta(hours=1))
 
 
@@ -59,11 +59,6 @@ intents.members = True
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
-# Per-hour state:
-# slots: {3..24: {"team": str, "tag": str, "manager_id": int, "vip": bool}}
-# waitlist: [{"team": str, "tag": str, "manager_id": int}]
-# slots_msg_id: int | None
-# last_day_reset: str | None (YYYY-MM-DD)
 scrim_state = {}
 _view_registered = False
 _schedule_task = None
@@ -123,9 +118,9 @@ async def set_reg_channel_writable(reg_ch: discord.TextChannel | None, allowed: 
         if current is not allowed:
             await reg_ch.set_permissions(reg_ch.guild.default_role, send_messages=allowed)
     except discord.Forbidden:
-        print(f"Missing Manage Permissions in #{reg_ch.name}")
+        print(f"[WARN] Missing Manage Permissions in #{reg_ch.name}")
     except Exception as e:
-        print(f"Error updating #{reg_ch.name} permissions: {e}")
+        print(f"[ERROR] set_reg_channel_writable #{reg_ch.name}: {e}")
 
 
 async def grant_view_access(channel: discord.TextChannel | None, member: discord.Member):
@@ -138,9 +133,9 @@ async def grant_view_access(channel: discord.TextChannel | None, member: discord
             read_message_history=True,
         )
     except discord.Forbidden:
-        print(f"Missing Manage Permissions for {member} in #{channel.name}")
+        print(f"[WARN] Missing Manage Permissions in #{channel.name} for {member}")
     except Exception as e:
-        print(f"Error granting access in #{channel.name}: {e}")
+        print(f"[ERROR] grant_view_access #{channel.name}: {e}")
 
 
 def format_slot_board(hour: int) -> str:
@@ -202,9 +197,9 @@ async def sync_slot_board(guild: discord.Guild, hour: int):
         msg = await slot_ch.send(content=content)
         st["slots_msg_id"] = msg.id
     except discord.Forbidden:
-        print(f"Missing permissions to send/edit in #{slot_ch.name}")
+        print(f"[WARN] Missing send/edit permissions in #{slot_ch.name}")
     except Exception as e:
-        print(f"Error syncing slot board in #{slot_ch.name}: {e}")
+        print(f"[ERROR] sync_slot_board #{slot_ch.name}: {e}")
 
 
 def is_vip_member(member: discord.Member) -> bool:
@@ -242,7 +237,7 @@ async def schedule_loop():
         try:
             await run_schedule_tick()
         except Exception as e:
-            print(f"Schedule loop error: {e}")
+            print(f"[ERROR] schedule_loop: {e}")
         await asyncio.sleep(15)
 
 
@@ -332,7 +327,7 @@ async def on_ready():
         init_hour_state(h)
     if _schedule_task is None or _schedule_task.done():
         _schedule_task = bot.loop.create_task(schedule_loop())
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    print(f"[OK] Logged in as {bot.user} (ID: {bot.user.id})")
 
 
 @bot.event
@@ -436,5 +431,8 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
+
+if not TOKEN or TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
+    raise RuntimeError("Missing bot token: set DISCORD_TOKEN in Railway Variables or replace TOKEN in bot.py.")
 
 bot.run(TOKEN)
