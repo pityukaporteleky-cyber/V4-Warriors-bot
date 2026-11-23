@@ -85,15 +85,13 @@ async def register_team(ctx, *, team_name: str = None):
 if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable!")
 
-bot.run(TOKEN)
-
 import os
 import discord
 from discord.ext import commands
 
 TOKEN = os.environ.get("DISCORD_TOKEN", "").strip()
 
-# Paste your copied Help category ID here (as an integer, without quotes), e.g.:
+# Paste your Help category ID here (as an integer, without quotes), e.g.:
 # HELP_CATEGORY_ID = 123456789012345678
 HELP_CATEGORY_ID = None
 
@@ -104,31 +102,20 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
-@bot.event
-async def on_ready():
-    print(f"Logged in as: {bot.user} (ID: {bot.user.id})")
-
-
-@bot.command(name="ping")
-async def ping_cmd(ctx):
-    await ctx.send(f"Pong! ({round(bot.latency * 1000)} ms)")
-
-
-@bot.command(name="ticket")
-async def ticket_cmd(ctx, *, reason: str = "No reason provided"):
-    guild = ctx.guild
-    if guild is None:
-        return
-
-    safe_user = "".join(c for c in ctx.author.name.lower() if c.isalnum() or c in "-_")[:20] or "user"
-    suffix = ctx.author.discriminator if ctx.author.discriminator != "0" else str(ctx.author.id % 10000)
+async def create_user_ticket(guild: discord.Guild, member: discord.Member, fallback_category):
+    safe_user = "".join(c for c in member.name.lower() if c.isalnum() or c in "-_")[:20] or "user"
+    suffix = member.discriminator if member.discriminator != "0" else str(member.id % 10000)
     channel_name = f"ticket-{safe_user}-{suffix}"
 
-    category = guild.get_channel(HELP_CATEGORY_ID) if HELP_CATEGORY_ID else ctx.channel.category
+    existing = discord.utils.get(guild.text_channels, name=channel_name)
+    if existing:
+        return existing, False
+
+    category = guild.get_channel(HELP_CATEGORY_ID) if HELP_CATEGORY_ID else fallback_category
 
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        ctx.author: discord.PermissionOverwrite(
+        member: discord.PermissionOverwrite(
             view_channel=True,
             send_messages=True,
             read_message_history=True,
@@ -154,15 +141,69 @@ async def ticket_cmd(ctx, *, reason: str = "No reason provided"):
         name=channel_name,
         category=category,
         overwrites=overwrites,
-        topic=f"Ticket opened by {ctx.author} (ID:{ctx.author.id}) | Reason: {reason[:180]}",
+        topic=f"Ticket opened by {member} (ID:{member.id})",
     )
 
     await ticket_channel.send(
-        f"{ctx.author.mention} ticket created!\n"
-        f"**Reason:** {reason}\n"
-        f"Use `!closeticket` to close this ticket."
+        f"{member.mention} your ticket has been created!\n"
+        f"Describe your issue here. Use `!closeticket` to close it."
     )
-    await ctx.send(f"Ticket opened: {ticket_channel.mention}")
+    return ticket_channel, True
+
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Open Ticket",
+        style=discord.ButtonStyle.green,
+        custom_id="v4_open_ticket_button",
+    )
+    async def open_ticket_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This button only works inside a server.", ephemeral=True)
+            return
+
+        try:
+            channel, created = await create_user_ticket(
+                interaction.guild,
+                interaction.user,
+                interaction.channel.category if interaction.channel else None,
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "Missing permissions! Give the bot **Manage Channels** permission.",
+                ephemeral=True,
+            )
+            return
+
+        if created:
+            await interaction.response.send_message(f"Ticket created: {channel.mention}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"You already have an open ticket: {channel.mention}", ephemeral=True)
+
+
+@bot.event
+async def on_ready():
+    bot.add_view(TicketPanelView())
+    print(f"Logged in as: {bot.user} (ID: {bot.user.id})")
+
+
+@bot.command(name="ping")
+async def ping_cmd(ctx):
+    await ctx.send(f"Pong! ({round(bot.latency * 1000)} ms)")
+
+
+@bot.command(name="ticketpanel")
+@commands.has_permissions(manage_guild=True)
+async def ticket_panel_cmd(ctx):
+    embed = discord.Embed(
+        title="Support / Help Ticket",
+        description="Need help with scrims, registration, or server issues?\nClick **Open Ticket** below to open a private ticket channel.",
+        color=discord.Color.blue(),
+    )
+    await ctx.send(embed=embed, view=TicketPanelView())
 
 
 @bot.command(name="closeticket")
@@ -189,4 +230,3 @@ if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable!")
 
 bot.run(TOKEN)
-
