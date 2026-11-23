@@ -389,6 +389,19 @@ async def on_message(message: discord.Message):
 
   await bot.process_commands(message)
 
+@bot.command(name="clear")
+@commands.has_permissions(manage_messages=True)
+async def clear_cmd(ctx: commands.Context, amount: int = 20):
+  deleted = await ctx.channel.purge(limit=max(1, min(amount, 100)) + 1)
+  await ctx.send(f"Deleted: {len(deleted) - 1} messages.", delete_after=3)
+
+
+# ==========================================
+# STARTUP
+# ==========================================
+TOKEN = os.getenv("DISCORD_TOKEN") or "PUT_YOUR_BOT_TOKEN_HERE"
+bot.run(TOKEN)
+
 
 # ==========================================
 # STARTUP
