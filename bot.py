@@ -1,18 +1,28 @@
 import asyncio
-from datetime import datetime, time
-from zoneinfo import ZoneInfo
+from datetime import datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import discord
 from discord.ext import commands
 
-TOKEN = "IDE_MASOLD_A_BOT_TOKENED"
+TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"
 PREFIX = "%"
 VIP_ROLE_NAME = "Vip_role"
-TIMEZONE = ZoneInfo("Europe/Budapest")
 
-# Menetrend sávonként:
-# vip: (nyit, zár)
-# reg: (nyit, zár) -> sima regisztráció (3-20. slot)
-# waitlist: (nyit, zár)
+
+def get_local_timezone():
+    try:
+        return ZoneInfo("Europe/Budapest")
+    except ZoneInfoNotFoundError:
+        # Fallback if tzdata is not installed in the container (CET = UTC+1)
+        return timezone(timedelta(hours=1))
+
+
+TIMEZONE = get_local_timezone()
+
+# Schedules per scrim hour:
+# vip: (open_time, close_time)
+# reg: (open_time, close_time) -> regular registration (slots 3-20)
+# waitlist: (open_time, close_time)
 SCHEDULES = {
     16: {
         "slot_channel": "16-slots",
@@ -49,12 +59,14 @@ intents.members = True
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
-# Állapot sávonként:
+# Per-hour state:
 # slots: {3..24: {"team": str, "tag": str, "manager_id": int, "vip": bool}}
 # waitlist: [{"team": str, "tag": str, "manager_id": int}]
 # slots_msg_id: int | None
-# last_day_reset: str | None (YYYY-MM-DD, napi új nyitáshoz)
+# last_day_reset: str | None (YYYY-MM-DD)
 scrim_state = {}
+_view_registered = False
+_schedule_task = None
 
 
 def init_hour_state(hour: int):
@@ -71,7 +83,6 @@ def init_hour_state(hour: int):
 def is_in_window(now_t: time, start_t: time, end_t: time) -> bool:
     if start_t <= end_t:
         return start_t <= now_t <= end_t
-    # Éjfélen átnyúló ablak esetére is biztonságos
     return now_t >= start_t or now_t <= end_t
 
 
@@ -107,28 +118,38 @@ def get_channels_for_hour(guild: discord.Guild, hour: int):
 async def set_reg_channel_writable(reg_ch: discord.TextChannel | None, allowed: bool):
     if reg_ch is None or reg_ch.guild.default_role is None:
         return
-    current = reg_ch.overwrites_for(reg_ch.guild.default_role).send_messages
-    if current is not allowed:
-        await reg_ch.set_permissions(reg_ch.guild.default_role, send_messages=allowed)
+    try:
+        current = reg_ch.overwrites_for(reg_ch.guild.default_role).send_messages
+        if current is not allowed:
+            await reg_ch.set_permissions(reg_ch.guild.default_role, send_messages=allowed)
+    except discord.Forbidden:
+        print(f"Missing Manage Permissions in #{reg_ch.name}")
+    except Exception as e:
+        print(f"Error updating #{reg_ch.name} permissions: {e}")
 
 
 async def grant_view_access(channel: discord.TextChannel | None, member: discord.Member):
     if channel is None:
         return
-    await channel.set_permissions(
-        member,
-        view_channel=True,
-        read_message_history=True,
-    )
+    try:
+        await channel.set_permissions(
+            member,
+            view_channel=True,
+            read_message_history=True,
+        )
+    except discord.Forbidden:
+        print(f"Missing Manage Permissions for {member} in #{channel.name}")
+    except Exception as e:
+        print(f"Error granting access in #{channel.name}: {e}")
 
 
 def format_slot_board(hour: int) -> str:
     st = init_hour_state(hour)
-    lines = [f"**{hour:02d}:00 SCRIM — SLOT LISTA**", ""]
-    lines.append("🔒 **Slot 1:** Zárolva (Locked)")
-    lines.append("🔒 **Slot 2:** Zárolva (Locked)")
+    lines = [f"**{hour:02d}:00 SCRIM — SLOT LIST**", ""]
+    lines.append("🔒 **Slot 1:** Locked")
+    lines.append("🔒 **Slot 2:** Locked")
     lines.append("")
-    lines.append("**Sima slotok (3–20):**")
+    lines.append("**Regular Slots (3–20):**")
     for s in range(3, 21):
         entry = st["slots"].get(s)
         if entry:
@@ -136,10 +157,10 @@ def format_slot_board(hour: int) -> str:
                 f"**Slot {s}:** {entry['team']} [{entry['tag']}] — <@{entry['manager_id']}>"
             )
         else:
-            lines.append(f"**Slot {s}:** *Szabad*")
+            lines.append(f"**Slot {s}:** *Open*")
 
     lines.append("")
-    lines.append(f"**VIP slotok (24–21 — `{VIP_ROLE_NAME}`):**")
+    lines.append(f"**VIP Slots (24–21 — `{VIP_ROLE_NAME}`):**")
     for s in [24, 23, 22, 21]:
         entry = st["slots"].get(s)
         if entry:
@@ -147,7 +168,7 @@ def format_slot_board(hour: int) -> str:
                 f"👑 **Slot {s}:** {entry['team']} [{entry['tag']}] — <@{entry['manager_id']}>"
             )
         else:
-            lines.append(f"👑 **Slot {s}:** *Szabad (VIP)*")
+            lines.append(f"👑 **Slot {s}:** *Open (VIP)*")
 
     if st["waitlist"]:
         lines.append("")
@@ -169,16 +190,21 @@ async def sync_slot_board(guild: discord.Guild, hour: int):
     content = format_slot_board(hour)
     msg_id = st.get("slots_msg_id")
 
-    if msg_id:
-        try:
-            msg = await slot_ch.fetch_message(msg_id)
-            await msg.edit(content=content)
-            return
-        except discord.NotFound:
-            pass
+    try:
+        if msg_id:
+            try:
+                msg = await slot_ch.fetch_message(msg_id)
+                await msg.edit(content=content)
+                return
+            except discord.NotFound:
+                pass
 
-    msg = await slot_ch.send(content=content)
-    st["slots_msg_id"] = msg.id
+        msg = await slot_ch.send(content=content)
+        st["slots_msg_id"] = msg.id
+    except discord.Forbidden:
+        print(f"Missing permissions to send/edit in #{slot_ch.name}")
+    except Exception as e:
+        print(f"Error syncing slot board in #{slot_ch.name}: {e}")
 
 
 def is_vip_member(member: discord.Member) -> bool:
@@ -193,9 +219,8 @@ async def run_schedule_tick():
     for guild in bot.guilds:
         for hour, cfg in SCHEDULES.items():
             st = init_hour_state(hour)
-            reg_ch, slot_ch, wait_ch, idpw_ch = get_channels_for_hour(guild, hour)
+            reg_ch, _, _, _ = get_channels_for_hour(guild, hour)
 
-            # Napi első nyitáskor (VIP ablak kezdetén) tiszta lista és tábla kiírása
             vip_start = cfg["vip"][0]
             if (
                 st["last_day_reset"] != today_str
@@ -208,7 +233,6 @@ async def run_schedule_tick():
                 await sync_slot_board(guild, hour)
 
             phase = get_active_phase(hour, now_t)
-            # Regisztrációs csatorna írásjog: nyitva VIP, sima és waitlist ablak alatt, máskor zárva
             await set_reg_channel_writable(reg_ch, phase is not None)
 
 
@@ -218,7 +242,7 @@ async def schedule_loop():
         try:
             await run_schedule_tick()
         except Exception as e:
-            print(f"Schedule loop hiba: {e}")
+            print(f"Schedule loop error: {e}")
         await asyncio.sleep(15)
 
 
@@ -227,7 +251,7 @@ class TicketButtonView(discord.ui.View):
         super().__init__(timeout=None)
 
     @discord.ui.button(
-        label="Ticket nyitása",
+        label="Open Ticket",
         style=discord.ButtonStyle.primary,
         emoji="🎫",
         custom_id="v4_scrim_ticket_button",
@@ -236,7 +260,7 @@ class TicketButtonView(discord.ui.View):
         guild = interaction.guild
         user = interaction.user
         if guild is None or not isinstance(user, discord.Member):
-            await interaction.response.send_message("Szerveren használható.", ephemeral=True)
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
             return
 
         safe_name = "".join(c for c in user.name.lower() if c.isalnum() or c in "-_")[:20] or "user"
@@ -245,7 +269,7 @@ class TicketButtonView(discord.ui.View):
         existing = discord.utils.get(guild.text_channels, name=channel_name)
         if existing is not None:
             await interaction.response.send_message(
-                f"Már van nyitott ticketed: {existing.mention}",
+                f"You already have an open ticket: {existing.mention}",
                 ephemeral=True,
             )
             return
@@ -268,39 +292,47 @@ class TicketButtonView(discord.ui.View):
             )
 
         category = interaction.channel.category if isinstance(interaction.channel, discord.TextChannel) else None
-        ticket_ch = await guild.create_text_channel(
-            name=channel_name,
-            overwrites=overwrites,
-            category=category,
-            reason=f"Scrim ticket nyitva: {user}",
-        )
-        await ticket_ch.send(
-            f"🎫 {user.mention} megnyitotta a ticketet. Írd le a kérdésedet vagy a problémádat, hamarosan válaszolunk!"
-        )
-        await interaction.response.send_message(
-            f"Ticket létrehozva: {ticket_ch.mention}",
-            ephemeral=True,
-        )
+        try:
+            ticket_ch = await guild.create_text_channel(
+                name=channel_name,
+                overwrites=overwrites,
+                category=category,
+                reason=f"Scrim ticket opened by {user}",
+            )
+            await ticket_ch.send(
+                f"🎫 {user.mention} opened a ticket. Describe your issue or question and staff will respond shortly."
+            )
+            await interaction.response.send_message(
+                f"Ticket created: {ticket_ch.mention}",
+                ephemeral=True,
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "I do not have permission to create ticket channels.",
+                ephemeral=True,
+            )
 
 
 @bot.command(name="ticket")
 @commands.has_permissions(manage_channels=True)
 async def ticket_panel(ctx: commands.Context):
     await ctx.send(
-        "**Scrim Támogatás / Ticket**\nHa segítségre vagy egyeztetésre van szükséged, kattints a gombra:",
+        "**Scrim Support / Ticket**\nNeed help or coordination? Click the button below:",
         view=TicketButtonView(),
     )
 
 
 @bot.event
 async def on_ready():
-    bot.add_view(TicketButtonView())
+    global _view_registered, _schedule_task
+    if not _view_registered:
+        bot.add_view(TicketButtonView())
+        _view_registered = True
     for h in SCHEDULES:
         init_hour_state(h)
-    if not getattr(bot, "_schedule_task_started", False):
-        bot._schedule_task_started = True
-        bot.loop.create_task(schedule_loop())
-    print(f"Bejelentkezve: {bot.user} (ID: {bot.user.id})")
+    if _schedule_task is None or _schedule_task.done():
+        _schedule_task = bot.loop.create_task(schedule_loop())
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
 
 @bot.event
@@ -331,7 +363,6 @@ async def on_message(message: discord.Message):
 
         st = init_hour_state(hour)
 
-        # Duplikáció ellenőrzés (manager vagy csapatnév)
         for existing in st["slots"].values():
             if (
                 existing["manager_id"] == manager.id
@@ -354,26 +385,22 @@ async def on_message(message: discord.Message):
 
         if phase == "vip":
             if vip:
-                # VIP ablakban (24-21 sorrendben) VIP slot keresése
                 for s in [24, 23, 22, 21]:
                     if s not in st["slots"]:
                         assigned_slot = s
                         break
         elif phase == "reg":
             if vip:
-                # VIP tag reg ablakban is kaphat szabad VIP (24-21) vagy sima (3-20) slotot
                 for s in [24, 23, 22, 21] + list(range(3, 21)):
                     if s not in st["slots"]:
                         assigned_slot = s
                         break
             else:
-                # Sima tag sima reg ablakban a 3-20. slotokba regisztrál
                 for s in range(3, 21):
                     if s not in st["slots"]:
                         assigned_slot = s
                         break
         elif phase == "waitlist":
-            # Waitlist ablakban közvetlenül wait-listre kerül
             assigned_slot = None
 
         if assigned_slot is not None:
@@ -392,7 +419,6 @@ async def on_message(message: discord.Message):
             )
             return
 
-        # Ha nincs szabad slot, vagy waitlist ablak van, vagy sima tag VIP ablakban próbálkozik -> wait-list
         st["waitlist"].append(
             {
                 "team": team_name,
