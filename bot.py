@@ -431,7 +431,7 @@ SCRIM_TZ = ZoneInfo("Europe/Bratislava")
 
 # VIP configuration: set your Discord VIP Role ID or exact role name
 VIP_ROLE_ID = 0  # Replace with your VIP role ID (int), e.g. 123456789012345678
-VIP_ROLE_NAME = "VIP"
+VIP_ROLE_NAME = "vip_role"
 VIP_EARLY_MINUTES = 30
 
 # Scrim configuration per hour prefix
