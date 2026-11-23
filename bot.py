@@ -5,9 +5,11 @@ import discord
 from discord.ext import commands
 
 TOKEN = os.environ.get("DISCORD_TOKEN", "").strip()
-SCRIM_TIMEZONE = ZoneInfo("Europe/Budapest")  # CET / CEST (16:00 CEST nyár, 16:00 CET tél)
-OPEN_HOUR = 16
+SCRIM_TIMEZONE = ZoneInfo("Europe/Budapest")
+OPEN_HOUR = 10
 OPEN_MINUTE = 0
+CLOSE_HOUR = 13
+CLOSE_MINUTE = 0
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -23,9 +25,10 @@ def current_scrim_time() -> datetime:
     return datetime.now(SCRIM_TIMEZONE)
 
 
-def is_after_open_time() -> bool:
+def is_within_open_window() -> bool:
     now = current_scrim_time()
-    return (now.hour, now.minute) >= (OPEN_HOUR, OPEN_MINUTE)
+    current_hm = (now.hour, now.minute)
+    return (OPEN_HOUR, OPEN_MINUTE) <= current_hm <= (CLOSE_HOUR, CLOSE_MINUTE)
 
 
 @bot.event
@@ -37,16 +40,16 @@ async def on_ready():
 @commands.has_permissions(manage_messages=True)
 async def open_reg(ctx):
     global registration_open, registered_teams
-    if not is_after_open_time():
+    if not is_within_open_window():
         now_str = current_scrim_time().strftime("%H:%M")
         await ctx.send(
-            f"A regisztráció csak **16:00** után nyitható meg (jelenlegi idő: **{now_str}**)."
+            f"A regisztráció csak **10:00 és 13:00** között nyitható meg (jelenlegi idő: **{now_str}**)."
         )
         return
     registered_teams = []
     registration_open = True
     await ctx.send(
-        "🟢 **16:00-s SCRIM REGISZTRÁCIÓ MEGNYITVA!**\n"
+        "🟢 **10:00–13:00 SCRIM REGISZTRÁCIÓ MEGNYITVA!**\n"
         "Írd be: `!reg <Csapatnév>` a jelentkezéshez!"
     )
 
@@ -63,7 +66,7 @@ async def close_reg(ctx):
 async def register_team(ctx, *, team_name: str):
     if not registration_open:
         await ctx.send(
-            f"{ctx.author.mention}, a regisztráció jelenleg nincs megnyitva (16:00-kor indul)."
+            f"{ctx.author.mention}, a regisztráció jelenleg nincs megnyitva (10:00–13:00)."
         )
         return
     if any(t["user_id"] == ctx.author.id for t in registered_teams):
