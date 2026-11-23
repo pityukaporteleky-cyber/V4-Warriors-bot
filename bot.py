@@ -408,3 +408,350 @@ bot.run(TOKEN)
 # ==========================================
 TOKEN = os.getenv("DISCORD_TOKEN") or "PUT_YOUR_BOT_TOKEN_HERE"
 bot.run(TOKEN)
+
+from datetime import datetime, time, timedelta
+import os
+import re
+from zoneinfo import ZoneInfo
+import discord
+from discord.ext import commands
+
+# ==========================================
+# BOT SETUP & INTENTS
+# ==========================================
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+intents.guilds = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Timezone for scrim schedule (Slovakia / CET)
+SCRIM_TZ = ZoneInfo("Europe/Bratislava")
+
+# VIP configuration: set your Discord VIP Role ID or exact role name
+VIP_ROLE_ID = 0  # Replace with your VIP role ID (int), e.g. 123456789012345678
+VIP_ROLE_NAME = "VIP"
+VIP_EARLY_MINUTES = 30
+
+# Scrim configuration per hour prefix
+# public_open: when non-VIP registration opens (VIPs can register 30 mins earlier)
+SCRIMS = {
+    "16": {
+        "label": "16:00 Scrim",
+        "scrim_time": time(16, 0),
+        "public_open": time(15, 30),  # VIPs can register from 15:00
+        "max_slots": 24,
+        "blocked_slots": [1, 2],
+        "vip_slots": [21, 22, 23, 24],
+        "manual_open": False,
+        "slots": {},  # {slot_number: entry_dict}
+        "waitlist": [],
+        "slot_board_msg_id": None,
+    },
+    "20": {
+        "label": "20:00 Scrim",
+        "scrim_time": time(20, 0),
+        "public_open": time(19, 30),  # VIPs can register from 19:00
+        "max_slots": 24,
+        "blocked_slots": [1, 2],
+        "vip_slots": [21, 22, 23, 24],
+        "manual_open": False,
+        "slots": {},
+        "waitlist": [],
+        "slot_board_msg_id": None,
+    },
+    "23": {
+        "label": "23:00 Scrim",
+        "scrim_time": time(23, 0),
+        "public_open": time(22, 30),  # VIPs can register from 22:00
+        "max_slots": 24,
+        "blocked_slots": [1, 2],
+        "vip_slots": [21, 22, 23, 24],
+        "manual_open": False,
+        "slots": {},
+        "waitlist": [],
+        "slot_board_msg_id": None,
+    },
+}
+
+
+# ==========================================
+# HELPER FUNCTIONS
+# ==========================================
+def detect_hour_prefix(channel_name: str) -> str | None:
+    """Detect scrim hour prefix ('16', '20', or '23') from channel name."""
+    match = re.match(r"^(16|20|23)\b", channel_name.lower().strip())
+    return match.group(1) if match else None
+
+
+def is_vip_member(member: discord.abc.User | discord.Member) -> bool:
+    """Check if a guild member has the configured VIP role."""
+    if not isinstance(member, discord.Member):
+        return False
+    for role in member.roles:
+        if VIP_ROLE_ID and role.id == VIP_ROLE_ID:
+            return True
+        if role.name.lower() == VIP_ROLE_NAME.lower():
+            return True
+    return False
+
+
+def can_register_now(cfg: dict, member: discord.abc.User | discord.Member) -> tuple[bool, str]:
+    """
+    Check if registration is currently allowed for this member.
+    VIP members can register 30 minutes earlier than public_open.
+    """
+    if not cfg.get("manual_open", False):
+        return False, "closed"
+
+    now = datetime.now(SCRIM_TZ)
+    today_public_open = datetime.combine(now.date(), cfg["public_open"], tzinfo=SCRIM_TZ)
+    today_vip_open = today_public_open - timedelta(minutes=VIP_EARLY_MINUTES)
+
+    vip = is_vip_member(member)
+    if vip:
+        if now >= today_vip_open:
+            return True, "vip"
+        return False, "too_early_vip"
+
+    if now >= today_public_open:
+        return True, "public"
+    return False, "vip_only_window"
+
+
+def get_next_available_slot(cfg: dict, vip: bool) -> int | None:
+    """
+    Assign a slot number:
+    - Slots 1 & 2 are blocked for everyone.
+    - Slots 21..24 are VIP slots.
+    - Slots 3..20 are regular slots.
+    """
+    blocked = set(cfg.get("blocked_slots", [1, 2]))
+    vip_slots = sorted(cfg.get("vip_slots", [21, 22, 23, 24]))
+    taken = set(cfg["slots"].keys())
+
+    if vip:
+        for slot_num in vip_slots:
+            if slot_num not in blocked and slot_num not in taken:
+                return slot_num
+
+    for slot_num in range(1, cfg.get("max_slots", 24) + 1):
+        if slot_num in blocked or slot_num in vip_slots or slot_num in taken:
+            continue
+        return slot_num
+
+    return None
+
+
+async def get_scrim_channels(guild: discord.Guild, hour_prefix: str):
+    """Find slot, id-pw, and waitlist text channels for a given hour prefix."""
+    slot_ch = None
+    idpw_ch = None
+    wait_ch = None
+
+    for ch in guild.text_channels:
+        name = ch.name.lower()
+        if name.startswith(f"{hour_prefix}-") or name.startswith(hour_prefix):
+            if "slot" in name:
+                slot_ch = ch
+            elif "id" in name or "pw" in name:
+                idpw_ch = ch
+            elif "wait" in name:
+                wait_ch = ch
+
+    return slot_ch, idpw_ch, wait_ch
+
+
+async def grant_channel_access(channel: discord.TextChannel | None, target: discord.abc.Snowflake):
+    """Grant view and read history access to a user/member on a channel."""
+    if channel is None or target is None:
+        return
+    try:
+        await channel.set_permissions(target, view_channel=True, read_message_history=True)
+    except discord.Forbidden:
+        pass
+
+
+async def update_slot_channel_board(guild: discord.Guild, hour_prefix: str, cfg: dict):
+    """Create or edit the live slot board message in #<hour>-slot / #<hour>-slots."""
+    slot_ch, _, _ = await get_scrim_channels(guild, hour_prefix)
+    if slot_ch is None:
+        return
+
+    total_slots = cfg.get("max_slots", 24)
+    blocked_slots = set(cfg.get("blocked_slots", [1, 2]))
+    vip_slots = set(cfg.get("vip_slots", [21, 22, 23, 24]))
+    slots_map = cfg.get("slots", {})
+
+    lines = [f"**{cfg['label']} — Slot List**"]
+    for i in range(1, total_slots + 1):
+        vip_tag = " *(VIP)*" if i in vip_slots else ""
+        if i in blocked_slots:
+            lines.append(f"`{i:02d}.` 🔒 *Locked*")
+        elif i in slots_map:
+            entry = slots_map[i]
+            lines.append(f"`{i:02d}.` **{entry['team']}** `[{entry['tag']}]` — {entry['manager'].mention}{vip_tag}")
+        else:
+            lines.append(f"`{i:02d}.` —{vip_tag}")
+
+    board_text = "\n".join(lines)
+    board_msg_id = cfg.get("slot_board_msg_id")
+
+    if board_msg_id:
+        try:
+            msg = await slot_ch.fetch_message(board_msg_id)
+            await msg.edit(content=board_text)
+            return
+        except discord.NotFound:
+            cfg["slot_board_msg_id"] = None
+
+    async for msg in slot_ch.history(limit=15):
+        if msg.author.id == bot.user.id and "Slot List" in msg.content:
+            await msg.edit(content=board_text)
+            cfg["slot_board_msg_id"] = msg.id
+            return
+
+    sent = await slot_ch.send(board_text)
+    cfg["slot_board_msg_id"] = sent.id
+
+
+async def handle_main_slot_added(guild: discord.Guild, hour_prefix: str, cfg: dict, author, manager=None):
+    """Grant slot + id-pw access and refresh the slot list board when a main slot is assigned."""
+    slot_ch, idpw_ch, _ = await get_scrim_channels(guild, hour_prefix)
+    await grant_channel_access(slot_ch, author)
+    await grant_channel_access(idpw_ch, author)
+    if manager:
+        await grant_channel_access(slot_ch, manager)
+        await grant_channel_access(idpw_ch, manager)
+    await update_slot_channel_board(guild, hour_prefix, cfg)
+
+
+async def handle_waitlist_added(guild: discord.Guild, hour_prefix: str, author, manager=None):
+    """Grant waitlist access when main slots are full."""
+    _, _, wait_ch = await get_scrim_channels(guild, hour_prefix)
+    await grant_channel_access(wait_ch, author)
+    if manager:
+        await grant_channel_access(wait_ch, manager)
+
+
+def parse_registration_message(content: str, message: discord.Message):
+    """
+    Expected format:
+    %register
+    Team Name
+    TAG
+    @Manager
+    """
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    if len(lines) < 3 or lines[0].lower() != "%register":
+        return None
+
+    team_name = lines[1]
+    tag = lines[2]
+    manager = message.mentions[0] if message.mentions else message.author
+    return team_name, tag, manager
+
+
+# ==========================================
+# EVENTS & COMMANDS
+# ==========================================
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot or not message.guild:
+        return
+
+    content_lower = message.content.strip().lower()
+    hour_prefix = detect_hour_prefix(message.channel.name)
+
+    if hour_prefix and "registration" in message.channel.name.lower():
+        cfg = SCRIMS[hour_prefix]
+
+        if content_lower == "open!":
+            cfg["manual_open"] = True
+            await message.add_reaction("✅")
+            await update_slot_channel_board(message.guild, hour_prefix, cfg)
+            return
+
+        if content_lower == "close!":
+            cfg["manual_open"] = False
+            await message.add_reaction("🔒")
+            return
+
+        if content_lower.startswith("%register"):
+            allowed, status = can_register_now(cfg, message.author)
+            if not allowed:
+                await message.add_reaction("❌")
+                if status == "vip_only_window":
+                    await message.reply(
+                        f"⏳ **{cfg['label']} — VIP early registration is active (30 mins early). Public registration opens at {cfg['public_open'].strftime('%H:%M')}.**",
+                        mention_author=False,
+                    )
+                return
+
+            parsed = parse_registration_message(message.content, message)
+            if not parsed:
+                await message.add_reaction("❌")
+                return
+
+            team_name, tag, manager = parsed
+
+            already_registered = any(s["author_id"] == message.author.id for s in cfg["slots"].values()) or any(
+                w["author_id"] == message.author.id for w in cfg["waitlist"]
+            )
+            if already_registered:
+                await message.add_reaction("⚠️")
+                return
+
+            vip = is_vip_member(message.author)
+            slot_number = get_next_available_slot(cfg, vip=vip)
+
+            entry = {
+                "author_id": message.author.id,
+                "team": team_name,
+                "tag": tag,
+                "manager": manager,
+                "vip": vip,
+            }
+
+            if slot_number is not None:
+                cfg["slots"][slot_number] = entry
+                vip_label = " *(VIP)*" if slot_number in cfg["vip_slots"] else ""
+                await message.add_reaction("✅")
+                await message.reply(
+                    f"✅ **{cfg['label']} | Slot #{slot_number}{vip_label} — {team_name} `[{tag}]` | Manager: {manager.mention}**",
+                    mention_author=False,
+                )
+                await handle_main_slot_added(message.guild, hour_prefix, cfg, message.author, manager)
+            else:
+                cfg["waitlist"].append(entry)
+                await message.add_reaction("⏳")
+                await message.reply(
+                    f"⏳ **{cfg['label']} — Main slots full, added to Waitlist (#{len(cfg['waitlist'])}) for {team_name} `[{tag}]`.**",
+                    mention_author=False,
+                )
+                await handle_waitlist_added(message.guild, hour_prefix, message.author, manager)
+            return
+
+    await bot.process_commands(message)
+
+
+@bot.command(name="clear")
+@commands.has_permissions(manage_messages=True)
+async def clear_cmd(ctx: commands.Context, amount: int = 20):
+    deleted = await ctx.channel.purge(limit=max(1, min(amount, 100)) + 1)
+    await ctx.send(f"Deleted: {len(deleted) - 1} messages.", delete_after=3)
+
+
+# ==========================================
+# STARTUP
+# ==========================================
+TOKEN = os.getenv("DISCORD_TOKEN") or "PUT_YOUR_BOT_TOKEN_HERE"
+bot.run(TOKEN)
+
+
