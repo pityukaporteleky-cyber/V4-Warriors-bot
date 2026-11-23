@@ -33,7 +33,7 @@ def is_within_open_window() -> bool:
 
 @bot.event
 async def on_ready():
-    print(f"Bejelentkezve mint: {bot.user} (ID: {bot.user.id})")
+    print(f"Logged in as: {bot.user} (ID: {bot.user.id})")
 
 
 @bot.command(name="ping")
@@ -44,12 +44,12 @@ async def ping_cmd(ctx):
 @bot.command(name="scrimstatus")
 async def scrim_status(ctx):
     now = current_scrim_time()
-    status_text = "NYITVA" if registration_open else "ZÁRVA"
-    window_text = "időablakon belül" if is_within_open_window() else "időablakon kívül"
+    status_text = "OPEN" if registration_open else "CLOSED"
+    window_text = "inside window" if is_within_open_window() else "outside window"
     await ctx.send(
-        f"Státusz: **{status_text}** ({window_text}) | "
-        f"Idő: `{now.strftime('%Y-%m-%d %H:%M')}` | "
-        f"Csapatok: `{len(registered_teams)}`"
+        f"Status: **{status_text}** ({window_text}) | "
+        f"Time: `{now.strftime('%Y-%m-%d %H:%M')}` | "
+        f"Teams: `{len(registered_teams)}`"
     )
 
 
@@ -59,7 +59,7 @@ async def open_reg(ctx):
     global registration_open, registered_teams
     registration_open = True
     registered_teams = []
-    await ctx.send("Scrim regisztráció **MEGNYITVA**!")
+    await ctx.send("Scrim registration is now **OPEN**!")
 
 
 @bot.command(name="close")
@@ -67,22 +67,22 @@ async def open_reg(ctx):
 async def close_reg(ctx):
     global registration_open
     registration_open = False
-    await ctx.send(f"Scrim regisztráció **LEZÁRVA**! Regisztrált csapatok: `{len(registered_teams)}`.")
+    await ctx.send(f"Scrim registration is now **CLOSED**! Registered teams: `{len(registered_teams)}`.")
 
 
 @bot.command(name="reg")
 async def register_team(ctx, *, team_name: str = None):
     if not registration_open:
-        await ctx.send("A regisztráció jelenleg zárva van.")
+        await ctx.send("Registration is currently closed.")
         return
     if not team_name:
-        await ctx.send("Add meg a csapatnevet! Példa: `!reg V4 | Warriors`")
+        await ctx.send("Please provide a team name! Example: `!reg V4 | Warriors`")
         return
     registered_teams.append(team_name.strip())
-    await ctx.send(f"Regisztrálva: **{team_name.strip()}** (#{len(registered_teams)})")
+    await ctx.send(f"Registered: **{team_name.strip()}** (#{len(registered_teams)})")
 
 
 if not TOKEN:
-    raise RuntimeError("Hiányzik a DISCORD_TOKEN környezeti változó!")
+    raise RuntimeError("Missing DISCORD_TOKEN environment variable!")
 
 bot.run(TOKEN)
