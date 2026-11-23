@@ -1,3 +1,106 @@
+from datetime import datetime
+import re
+from zoneinfo import ZoneInfo
+import discord
+from discord.ext import commands, tasks
+
+TZ = ZoneInfo("Europe/Bratislava")
+_last_day = None
+
+
+def _in_win(now_hm: tuple[int, int], win: tuple[int, int, int, int]) -> bool:
+  sh, sm, eh, em = win
+  return (sh, sm) <= now_hm < (eh, em)
+
+
+def _match_scrim(text: str) -> str | None:
+  t = text.strip().lower()
+  if "16:00" in t or t.startswith("16 ") or t.endswith(" 16") or t == "16":
+    return "16"
+  if "20:00" in t or t.startswith("20 ") or t.endswith(" 20") or t == "20":
+    return "20"
+  if "23:00" in t or t.startswith("23 ") or t.endswith(" 23") or t == "23":
+    return "23"
+  return None
+
+
+# 1. Automatic opening & closing at exact scheduled times (16:00, 20:00, 23:00)
+@tasks.loop(minutes=1)
+async def auto_scrim_schedule():
+  global _last_day
+  now = datetime.now(TZ)
+  today = now.date()
+  now_hm = (now.hour, now.minute)
+
+  if _last_day != today:
+    _last_day = today
+    for cfg in SCRIM_CONFIGS.values():
+      cfg["open"] = False
+      cfg["auto_opened"] = False
+      cfg["manual_closed"] = False
+
+  for key, cfg in SCRIM_CONFIGS.items():
+    should_open = _in_win(now_hm, cfg["main_window"]) or _in_win(
+        now_hm, cfg["waitlist_window"]
+    )
+
+    if should_open and not cfg["open"] and not cfg.get("manual_closed"):
+      cfg["open"] = True
+      cfg["auto_opened"] = True
+    elif not should_open and cfg["open"] and cfg.get("auto_opened"):
+      cfg["open"] = False
+      cfg["auto_opened"] = False
+
+
+# 2. Manual "open" / "close" messages in chat for 16:00, 20:00, and 23:00 scrims
+async def handle_open_close_message(message: discord.Message):
+  if message.author.bot:
+    return
+  low = message.content.strip().lower()
+  if "open" not in low and "close" not in low:
+    return
+
+  key = _match_scrim(low)
+  if not key or key not in SCRIM_CONFIGS:
+    return
+
+  cfg = SCRIM_CONFIGS[key]
+  if "open" in low:
+    cfg["open"] = True
+    cfg["manual_closed"] = False
+    await message.add_reaction("✅")
+  elif "close" in low:
+    cfg["open"] = False
+    cfg["manual_closed"] = True
+    await message.add_reaction("🔒")
+
+
+# 3. %register format parser (Team name / Team tag / @manager) without overwriting your existing registration logic
+def parse_percent_register(raw_args: str, message: discord.Message):
+  lines = [line.strip() for line in raw_args.splitlines() if line.strip()]
+  team_name = lines[0] if len(lines) >= 1 else None
+  team_tag = lines[1] if len(lines) >= 2 else None
+
+  manager = message.mentions[0] if message.mentions else None
+  if not manager and len(lines) >= 3:
+    m = re.search(r"<@!?(\d+)>", lines[2])
+    if m and message.guild:
+      manager = message.guild.get_member(int(m.group(1)))
+
+  return team_name, team_tag, manager
+
+
+@bot.command(name="register")
+async def percent_register(ctx: commands.Context, *, body: str = ""):
+  team_name, team_tag, manager = parse_percent_register(body, ctx.message)
+  if not team_name or not team_tag or not manager:
+    await ctx.message.add_reaction(EMOJI_BAD)
+    return
+
+  # Pass team_name, team_tag, and manager into your existing registration / slots / waitlist / emoji / ID-PW flow here.
+
+
+
 import os
 import re
 from datetime import datetime
@@ -636,3 +739,10 @@ if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable!")
 
 bot.run(TOKEN)
+
+
+%register
+Team name
+Team tag
+@manager
+
