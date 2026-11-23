@@ -28,7 +28,7 @@ def current_scrim_time() -> datetime:
 def is_within_open_window() -> bool:
     now = current_scrim_time()
     current_hm = (now.hour, now.minute)
-    return (OPEN_HOUR, OPEN_MINUTE) <= current_hm <= (CLOSE_HOUR, CLOSE_MINUTE)
+    return (OPEN_HOUR, OPEN_MINUTE) <= current_hm < (CLOSE_HOUR, CLOSE_MINUTE)
 
 
 @bot.event
@@ -36,63 +36,50 @@ async def on_ready():
     print(f"Bejelentkezve mint: {bot.user} (ID: {bot.user.id})")
 
 
-@bot.command(name="nyit")
-@commands.has_permissions(manage_messages=True)
-async def open_reg(ctx):
-    global registration_open, registered_teams
-    if not is_within_open_window():
-        now_str = current_scrim_time().strftime("%H:%M")
-        await ctx.send(
-            f"A regisztráció csak **10:00 és 13:00** között nyitható meg (jelenlegi idő: **{now_str}**)."
-        )
-        return
-    registered_teams = []
-    registration_open = True
+@bot.command(name="ping")
+async def ping_cmd(ctx):
+    await ctx.send(f"Pong! ({round(bot.latency * 1000)} ms)")
+
+
+@bot.command(name="scrimstatus")
+async def scrim_status(ctx):
+    now = current_scrim_time()
+    status_text = "NYITVA" if registration_open else "ZÁRVA"
+    window_text = "időablakon belül" if is_within_open_window() else "időablakon kívül"
     await ctx.send(
-        "🟢 **10:00–13:00 SCRIM REGISZTRÁCIÓ MEGNYITVA!**\n"
-        "Írd be: `!reg <Csapatnév>` a jelentkezéshez!"
+        f"Státusz: **{status_text}** ({window_text}) | "
+        f"Idő: `{now.strftime('%Y-%m-%d %H:%M')}` | "
+        f"Csapatok: `{len(registered_teams)}`"
     )
 
 
-@bot.command(name="zar")
-@commands.has_permissions(manage_messages=True)
+@bot.command(name="open")
+@commands.has_permissions(manage_guild=True)
+async def open_reg(ctx):
+    global registration_open, registered_teams
+    registration_open = True
+    registered_teams = []
+    await ctx.send("Scrim regisztráció **MEGNYITVA**!")
+
+
+@bot.command(name="close")
+@commands.has_permissions(manage_guild=True)
 async def close_reg(ctx):
     global registration_open
     registration_open = False
-    await ctx.send("🔴 **A scrim regisztráció lezárult!**")
+    await ctx.send(f"Scrim regisztráció **LEZÁRVA**! Regisztrált csapatok: `{len(registered_teams)}`.")
 
 
 @bot.command(name="reg")
-async def register_team(ctx, *, team_name: str):
+async def register_team(ctx, *, team_name: str = None):
     if not registration_open:
-        await ctx.send(
-            f"{ctx.author.mention}, a regisztráció jelenleg nincs megnyitva (10:00–13:00)."
-        )
+        await ctx.send("A regisztráció jelenleg zárva van.")
         return
-    if any(t["user_id"] == ctx.author.id for t in registered_teams):
-        await ctx.send(f"{ctx.author.mention}, te már regisztráltál csapatot!")
+    if not team_name:
+        await ctx.send("Add meg a csapatnevet! Példa: `!reg V4 | Warriors`")
         return
-
-    slot = len(registered_teams) + 1
-    registered_teams.append(
-        {
-            "slot": slot,
-            "team_name": team_name.strip(),
-            "user_id": ctx.author.id,
-        }
-    )
-    await ctx.send(
-        f"✅ **Slot #{slot}** rögzítve: **{team_name.strip()}** ({ctx.author.mention})"
-    )
-
-
-@bot.command(name="lista")
-async def list_teams(ctx):
-    if not registered_teams:
-        await ctx.send("Még nincs regisztrált csapat.")
-        return
-    lines = [f"**#{t['slot']}** – {t['team_name']}" for t in registered_teams]
-    await ctx.send("📋 **Regisztrált csapatok:**\n" + "\n".join(lines))
+    registered_teams.append(team_name.strip())
+    await ctx.send(f"Regisztrálva: **{team_name.strip()}** (#{len(registered_teams)})")
 
 
 if not TOKEN:
