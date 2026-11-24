@@ -1,5 +1,6 @@
 import asyncio
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, time, timedelta
+import json
 import os
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import discord
@@ -9,10 +10,30 @@ TOKEN = os.getenv("DISCORD_TOKEN", "PASTE_YOUR_BOT_TOKEN_HERE")
 PREFIX = "%"
 VIP_ROLE_NAME = "Vip_role"
 
+# Optional welcome channel name (leave "" to auto-pick first writable channel)
+WELCOME_CHANNEL_NAME = ""
+
 TDM_REG_CHANNEL = "tdm-registration"
 TDM_SLOT_CHANNEL = "tdm-slot"
 TDM_IDPW_CHANNEL = "tdm-id-pw"
 TDM_MAX_SLOTS = 40
+
+TOURNAMENT_20_CFG = {
+    "label": "20:00 TOURNAMENT",
+    "slot_channel": "20-tournamnet-slot",
+    "reg_channel": "20-tournament-registration",
+    "wait_channel": None,
+    "idpw_channel": "20-tournamnet-id-pw",
+    "vip": (time(14, 30), time(14, 55)),
+    "reg": (time(15, 0), time(16, 30)),
+    "waitlist": (time(19, 20), time(19, 30)),
+}
+
+SCRIMS_BAN_CHANNEL = "scrims-ban"
+TOURNAMENT_BAN_CHANNEL = "tournament-ban"
+PERMABAN_CHANNEL = "permaban"
+UNBAN_FEE_EUR = 5
+BAN_DATA_FILE = "bans_data.json"
 
 
 def get_local_timezone():
@@ -26,6 +47,7 @@ TIMEZONE = get_local_timezone()
 
 SCHEDULES = {
     16: {
+        "label": "16:00 SCRIM",
         "slot_channel": "16-slots",
         "reg_channel": "16-registration",
         "wait_channel": "16-wait-list",
@@ -35,6 +57,7 @@ SCHEDULES = {
         "waitlist": (time(15, 20), time(15, 30)),
     },
     20: {
+        "label": "20:00 SCRIM",
         "slot_channel": "20-slot",
         "reg_channel": "20-registration",
         "wait_channel": "20-wait-list",
@@ -44,6 +67,7 @@ SCHEDULES = {
         "waitlist": (time(19, 20), time(19, 30)),
     },
     23: {
+        "label": "23:00 SCRIM",
         "slot_channel": "23-slot",
         "reg_channel": "23-registration",
         "wait_channel": "23-wait-list",
@@ -62,15 +86,147 @@ intents.reactions = True
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
 scrim_state = {}
+tourney20_state = {
+    "slots": {},
+    "slots_msg_id": None,
+    "last_day_reset": None,
+    "manual_open": None,
+}
 tdm_state = {
     "slots": {},          # {1..40: {"name": str, "manager_id": int, "confirmed": bool}}
     "slots_msg_id": None,
     "is_open": False,
 }
+ban_records = {}
+
 _view_registered = False
 _schedule_task = None
 
 
+# =========================================================
+# BAN STORAGE & HELPERS
+# =========================================================
+def load_ban_records():
+    global ban_records
+    if os.path.exists(BAN_DATA_FILE):
+        try:
+            with open(BAN_DATA_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    ban_records = data
+        except Exception as e:
+            print(f"[ERROR] load_ban_records: {e}")
+
+
+def save_ban_records():
+    try:
+        with open(BAN_DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(ban_records, f, indent=2)
+    except Exception as e:
+        print(f"[ERROR] save_ban_records: {e}")
+
+
+def get_ban_info(user_id: int) -> dict:
+    key = str(user_id)
+    rec = ban_records.get(key)
+    if not rec:
+        return {"misses": 0, "ban_until": None, "permanent": False, "active": False, "label": "None"}
+
+    if rec.get("permanent"):
+        return {
+            "misses": rec.get("misses", 4),
+            "ban_until": None,
+            "permanent": True,
+            "active": True,
+            "label": "PERMANENT BAN",
+        }
+
+    until_str = rec.get("ban_until")
+    if until_str:
+        try:
+            until_dt = datetime.fromisoformat(until_str)
+            now_dt = datetime.now(TIMEZONE)
+            if now_dt < until_dt:
+                return {
+                    "misses": rec.get("misses", 0),
+                    "ban_until": until_str,
+                    "permanent": False,
+                    "active": True,
+                    "label": f"Until {until_dt.strftime('%Y-%m-%d %H:%M')}",
+                }
+        except Exception:
+            pass
+
+    return {
+        "misses": rec.get("misses", 0),
+        "ban_until": None,
+        "permanent": False,
+        "active": False,
+        "label": "Expired",
+    }
+
+
+def apply_missed_match_ban(user_id: int) -> dict:
+    key = str(user_id)
+    rec = ban_records.get(key, {"misses": 0, "ban_until": None, "permanent": False})
+    misses = int(rec.get("misses", 0)) + 1
+    now_dt = datetime.now(TIMEZONE)
+
+    if misses == 1:
+        until_dt = now_dt + timedelta(days=2)
+        rec = {"misses": 1, "ban_until": until_dt.isoformat(), "permanent": False}
+        duration_text = "2 days"
+        is_perma = False
+    elif misses == 2:
+        until_dt = now_dt + timedelta(days=7)
+        rec = {"misses": 2, "ban_until": until_dt.isoformat(), "permanent": False}
+        duration_text = "1 week (7 days)"
+        is_perma = False
+    elif misses == 3:
+        until_dt = now_dt + timedelta(days=30)
+        rec = {"misses": 3, "ban_until": until_dt.isoformat(), "permanent": False}
+        duration_text = "1 month (30 days)"
+        is_perma = False
+    else:
+        rec = {"misses": misses, "ban_until": None, "permanent": True}
+        duration_text = "PERMANENT"
+        is_perma = True
+
+    ban_records[key] = rec
+    save_ban_records()
+    return {
+        "misses": misses,
+        "duration_text": duration_text,
+        "permanent": is_perma,
+    }
+
+
+def clear_user_ban(user_id: int):
+    key = str(user_id)
+    if key in ban_records:
+        ban_records[key]["ban_until"] = None
+        ban_records[key]["permanent"] = False
+        ban_records[key]["misses"] = 0
+        save_ban_records()
+
+
+async def post_ban_log(guild: discord.Guild, mode: str, user_id: int, reason_line: str, permanent: bool):
+    member = guild.get_member(user_id)
+    mention = member.mention if member else f"<@{user_id}>"
+    target_ch_name = PERMABAN_CHANNEL if permanent else (
+        SCRIMS_BAN_CHANNEL if mode == "scrim" else TOURNAMENT_BAN_CHANNEL
+    )
+    ch = discord.utils.get(guild.text_channels, name=target_ch_name)
+    if isinstance(ch, discord.TextChannel):
+        try:
+            await ch.send(f"🚫 {mention} (`{user_id}`) — {reason_line}")
+        except Exception as e:
+            print(f"[ERROR] post_ban_log #{target_ch_name}: {e}")
+
+
+# =========================================================
+# SCHEDULE & CHANNEL HELPERS
+# =========================================================
 def init_hour_state(hour: int):
     if hour not in scrim_state:
         scrim_state[hour] = {
@@ -78,6 +234,7 @@ def init_hour_state(hour: int):
             "waitlist": [],
             "slots_msg_id": None,
             "last_day_reset": None,
+            "manual_open": None,
         }
     return scrim_state[hour]
 
@@ -88,14 +245,24 @@ def is_in_window(now_t: time, start_t: time, end_t: time) -> bool:
     return now_t >= start_t or now_t <= end_t
 
 
-def get_active_phase(hour: int, now_t: time) -> str | None:
-    cfg = SCHEDULES[hour]
+def get_phase_from_cfg(cfg: dict, now_t: time) -> str | None:
     if is_in_window(now_t, cfg["vip"][0], cfg["vip"][1]):
         return "vip"
     if is_in_window(now_t, cfg["reg"][0], cfg["reg"][1]):
         return "reg"
     if is_in_window(now_t, cfg["waitlist"][0], cfg["waitlist"][1]):
         return "waitlist"
+    return None
+
+
+def get_active_phase(hour: int, now_t: time, manual_open: bool | None = None) -> str | None:
+    if manual_open is False:
+        return None
+    phase = get_phase_from_cfg(SCHEDULES[hour], now_t)
+    if phase is not None:
+        return phase
+    if manual_open is True:
+        return "reg"
     return None
 
 
@@ -115,6 +282,13 @@ def get_channels_for_hour(guild: discord.Guild, hour: int):
     wait_ch = discord.utils.get(guild.text_channels, name=cfg["wait_channel"])
     idpw_ch = discord.utils.get(guild.text_channels, name=cfg["idpw_channel"])
     return reg_ch, slot_ch, wait_ch, idpw_ch
+
+
+def get_tourney20_channels(guild: discord.Guild):
+    reg_ch = discord.utils.get(guild.text_channels, name=TOURNAMENT_20_CFG["reg_channel"])
+    slot_ch = discord.utils.get(guild.text_channels, name=TOURNAMENT_20_CFG["slot_channel"])
+    idpw_ch = discord.utils.get(guild.text_channels, name=TOURNAMENT_20_CFG["idpw_channel"])
+    return reg_ch, slot_ch, idpw_ch
 
 
 async def set_channel_writable(channel: discord.TextChannel | None, allowed: bool):
@@ -145,15 +319,26 @@ async def grant_view_access(channel: discord.TextChannel | None, member: discord
         print(f"[ERROR] grant_view_access #{channel.name}: {e}")
 
 
-async def revoke_view_access(channel: discord.TextChannel | None, member: discord.Member):
+async def revoke_view_access(channel: discord.TextChannel | None, member: discord.Member | discord.Object):
     if channel is None:
         return
     try:
         await channel.set_permissions(member, overwrite=None)
     except discord.Forbidden:
-        print(f"[WARN] Missing Manage Permissions in #{channel.name} for {member}")
+        print(f"[WARN] Missing Manage Permissions in #{channel.name}")
     except Exception as e:
         print(f"[ERROR] revoke_view_access #{channel.name}: {e}")
+
+
+async def purge_idpw_channel(idpw_ch: discord.TextChannel | None):
+    if not isinstance(idpw_ch, discord.TextChannel):
+        return
+    try:
+        await idpw_ch.purge(limit=100)
+    except discord.Forbidden:
+        print(f"[WARN] Missing Manage Messages in #{idpw_ch.name}")
+    except Exception as e:
+        print(f"[ERROR] purge_idpw_channel #{idpw_ch.name}: {e}")
 
 
 async def ensure_board_reactions(msg: discord.Message):
@@ -167,12 +352,15 @@ async def ensure_board_reactions(msg: discord.Message):
         print(f"[ERROR] ensure_board_reactions: {e}")
 
 
+def is_vip_member(member: discord.Member) -> bool:
+    return any(r.name == VIP_ROLE_NAME for r in member.roles)
+
+
 # =========================================================
-# SCRIM BOARD (16:00 / 20:00 / 23:00)
+# FORMATTERS & SYNCERS (SCRIM / 20 TOURNAMENT / TDM)
 # =========================================================
-def format_slot_board(hour: int) -> str:
-    st = init_hour_state(hour)
-    lines = [f"**{hour:02d}:00 SCRIM — SLOT LIST**", ""]
+def format_slot_board_from_state(title: str, st: dict, include_waitlist: bool = True) -> str:
+    lines = [f"**{title} — SLOT LIST**", ""]
     lines.append("🔒 **Slot 1:** Locked")
     lines.append("🔒 **Slot 2:** Locked")
     lines.append("")
@@ -199,7 +387,7 @@ def format_slot_board(hour: int) -> str:
         else:
             lines.append(f"👑 **Slot {s}:** *Open (VIP)*")
 
-    if st["waitlist"]:
+    if include_waitlist and st.get("waitlist"):
         lines.append("")
         lines.append("**Wait-list:**")
         for idx, w in enumerate(st["waitlist"], start=1):
@@ -210,15 +398,10 @@ def format_slot_board(hour: int) -> str:
     return "\n".join(lines)
 
 
-async def sync_slot_board(guild: discord.Guild, hour: int):
-    st = init_hour_state(hour)
-    _, slot_ch, _, _ = get_channels_for_hour(guild, hour)
+async def sync_board_message(slot_ch: discord.TextChannel | None, st: dict, content: str):
     if slot_ch is None:
         return
-
-    content = format_slot_board(hour)
     msg_id = st.get("slots_msg_id")
-
     try:
         if msg_id:
             try:
@@ -235,12 +418,22 @@ async def sync_slot_board(guild: discord.Guild, hour: int):
     except discord.Forbidden:
         print(f"[WARN] Missing send/edit permissions in #{slot_ch.name}")
     except Exception as e:
-        print(f"[ERROR] sync_slot_board #{slot_ch.name}: {e}")
+        print(f"[ERROR] sync_board_message #{slot_ch.name}: {e}")
 
 
-# =========================================================
-# TDM TOURNAMENT BOARD (40 SLOTS)
-# =========================================================
+async def sync_slot_board(guild: discord.Guild, hour: int):
+    st = init_hour_state(hour)
+    _, slot_ch, _, _ = get_channels_for_hour(guild, hour)
+    content = format_slot_board_from_state(f"{hour:02d}:00 SCRIM", st, include_waitlist=True)
+    await sync_board_message(slot_ch, st, content)
+
+
+async def sync_tourney20_board(guild: discord.Guild):
+    _, slot_ch, _ = get_tourney20_channels(guild)
+    content = format_slot_board_from_state("20:00 TOURNAMENT", tourney20_state, include_waitlist=False)
+    await sync_board_message(slot_ch, tourney20_state, content)
+
+
 def format_tdm_board() -> str:
     status = "OPEN" if tdm_state["is_open"] else "CLOSED"
     lines = [f"**TDM TOURNAMENT — SLOT LIST ({status})**", ""]
@@ -259,35 +452,71 @@ def format_tdm_board() -> str:
 
 async def sync_tdm_board(guild: discord.Guild):
     slot_ch = discord.utils.get(guild.text_channels, name=TDM_SLOT_CHANNEL)
-    if slot_ch is None:
-        return
+    await sync_board_message(slot_ch, tdm_state, format_tdm_board())
 
-    content = format_tdm_board()
-    msg_id = tdm_state.get("slots_msg_id")
 
-    try:
-        if msg_id:
+# =========================================================
+# FULL RESET HELPERS (reset!)
+# =========================================================
+async def revoke_user_ids_from_channels(guild: discord.Guild, user_ids: set[int], channels: list[discord.TextChannel | None]):
+    for uid in user_ids:
+        member = guild.get_member(uid)
+        if member is None:
             try:
-                msg = await slot_ch.fetch_message(msg_id)
-                await msg.edit(content=content)
-                await ensure_board_reactions(msg)
-                return
-            except discord.NotFound:
-                pass
-
-        msg = await slot_ch.send(content=content)
-        tdm_state["slots_msg_id"] = msg.id
-        await ensure_board_reactions(msg)
-    except discord.Forbidden:
-        print(f"[WARN] Missing send/edit permissions in #{slot_ch.name}")
-    except Exception as e:
-        print(f"[ERROR] sync_tdm_board #{slot_ch.name}: {e}")
+                member = await guild.fetch_member(uid)
+            except Exception:
+                member = None
+        target = member if member is not None else discord.Object(id=uid)
+        for ch in channels:
+            await revoke_view_access(ch, target)
 
 
-def is_vip_member(member: discord.Member) -> bool:
-    return any(r.name == VIP_ROLE_NAME for r in member.roles)
+async def reset_scrim_hour(guild: discord.Guild, hour: int):
+    st = init_hour_state(hour)
+    _, slot_ch, wait_ch, idpw_ch = get_channels_for_hour(guild, hour)
+
+    user_ids = {entry["manager_id"] for entry in st["slots"].values()}
+    user_ids.update(w["manager_id"] for w in st["waitlist"])
+
+    await revoke_user_ids_from_channels(guild, user_ids, [slot_ch, wait_ch, idpw_ch])
+    await purge_idpw_channel(idpw_ch)
+
+    st["slots"] = {}
+    st["waitlist"] = []
+    st["slots_msg_id"] = None
+    st["manual_open"] = None
+    await sync_slot_board(guild, hour)
 
 
+async def reset_tourney20(guild: discord.Guild):
+    _, slot_ch, idpw_ch = get_tourney20_channels(guild)
+
+    user_ids = {entry["manager_id"] for entry in tourney20_state["slots"].values()}
+    await revoke_user_ids_from_channels(guild, user_ids, [slot_ch, idpw_ch])
+    await purge_idpw_channel(idpw_ch)
+
+    tourney20_state["slots"] = {}
+    tourney20_state["slots_msg_id"] = None
+    tourney20_state["manual_open"] = None
+    await sync_tourney20_board(guild)
+
+
+async def reset_tdm(guild: discord.Guild):
+    slot_ch = discord.utils.get(guild.text_channels, name=TDM_SLOT_CHANNEL)
+    idpw_ch = discord.utils.get(guild.text_channels, name=TDM_IDPW_CHANNEL)
+
+    user_ids = {entry["manager_id"] for entry in tdm_state["slots"].values()}
+    await revoke_user_ids_from_channels(guild, user_ids, [slot_ch, idpw_ch])
+    await purge_idpw_channel(idpw_ch)
+
+    tdm_state["slots"] = {}
+    tdm_state["slots_msg_id"] = None
+    await sync_tdm_board(guild)
+
+
+# =========================================================
+# SCHEDULE LOOP
+# =========================================================
 async def run_schedule_tick():
     now = datetime.now(TIMEZONE)
     now_t = now.time()
@@ -307,10 +536,38 @@ async def run_schedule_tick():
                 st["waitlist"] = []
                 st["slots_msg_id"] = None
                 st["last_day_reset"] = today_str
+                st["manual_open"] = None
                 await sync_slot_board(guild, hour)
 
-            phase = get_active_phase(hour, now_t)
-            await set_channel_writable(reg_ch, phase is not None)
+            if st.get("manual_open") is True:
+                is_open = True
+            elif st.get("manual_open") is False:
+                is_open = False
+            else:
+                is_open = get_phase_from_cfg(cfg, now_t) is not None
+
+            await set_channel_writable(reg_ch, is_open)
+
+        t_reg_ch, _, _ = get_tourney20_channels(guild)
+        t_vip_start = TOURNAMENT_20_CFG["vip"][0]
+        if (
+            tourney20_state["last_day_reset"] != today_str
+            and is_in_window(now_t, t_vip_start, TOURNAMENT_20_CFG["waitlist"][1])
+        ):
+            tourney20_state["slots"] = {}
+            tourney20_state["slots_msg_id"] = None
+            tourney20_state["last_day_reset"] = today_str
+            tourney20_state["manual_open"] = None
+            await sync_tourney20_board(guild)
+
+        if tourney20_state.get("manual_open") is True:
+            t_open = True
+        elif tourney20_state.get("manual_open") is False:
+            t_open = False
+        else:
+            t_open = get_phase_from_cfg(TOURNAMENT_20_CFG, now_t) is not None
+
+        await set_channel_writable(t_reg_ch, t_open)
 
 
 async def schedule_loop():
@@ -323,6 +580,9 @@ async def schedule_loop():
         await asyncio.sleep(15)
 
 
+# =========================================================
+# TICKET SYSTEM
+# =========================================================
 class TicketButtonView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -399,19 +659,174 @@ async def ticket_panel(ctx: commands.Context):
     )
 
 
-@bot.command(name="tdm-reset")
+# =========================================================
+# NO-SHOW / BAN / UNBAN COMMANDS
+# =========================================================
+@bot.command(name="noshow")
 @commands.has_permissions(manage_channels=True)
-async def tdm_reset(ctx: commands.Context):
-    tdm_state["slots"] = {}
-    tdm_state["slots_msg_id"] = None
-    if ctx.guild:
-        await sync_tdm_board(ctx.guild)
-    await ctx.send("🔄 TDM Tournament slots reset (1–40).")
+async def noshow_cmd(ctx: commands.Context, mode: str, arg1: str, arg2: str | None = None):
+    if ctx.guild is None:
+        return
+
+    mode_l = mode.lower()
+    target_user_id: int | None = ctx.message.mentions[0].id if ctx.message.mentions else None
+    removed_slot_text = ""
+    log_mode = "scrim" if mode_l == "scrim" else "tournament"
+
+    if mode_l == "scrim":
+        try:
+            hour = int(arg1)
+        except ValueError:
+            await ctx.send("❌ Usage: `%noshow scrim <16|20|23> <slot_number | @user>`")
+            return
+        if hour not in SCHEDULES:
+            await ctx.send("❌ Invalid scrim hour. Use `16`, `20`, or `23`.")
+            return
+
+        st = init_hour_state(hour)
+        _, slot_ch, _, idpw_ch = get_channels_for_hour(ctx.guild, hour)
+
+        if target_user_id is None and arg2 is not None:
+            try:
+                slot_num = int(arg2)
+                entry = st["slots"].pop(slot_num, None)
+                if entry:
+                    target_user_id = entry["manager_id"]
+                    removed_slot_text = f" (Slot #{slot_num} deleted: {entry['team']} [{entry['tag']}])"
+                    await sync_slot_board(ctx.guild, hour)
+            except ValueError:
+                pass
+        elif target_user_id is not None:
+            for s, entry in list(st["slots"].items()):
+                if entry["manager_id"] == target_user_id:
+                    del st["slots"][s]
+                    removed_slot_text = f" (Slot #{s} deleted)"
+                    await sync_slot_board(ctx.guild, hour)
+                    break
+
+        if target_user_id is not None:
+            m = ctx.guild.get_member(target_user_id) or discord.Object(id=target_user_id)
+            await revoke_view_access(slot_ch, m)
+            await revoke_view_access(idpw_ch, m)
+
+    elif mode_l in ("t20", "tourney20", "tournament"):
+        if target_user_id is None:
+            try:
+                slot_num = int(arg1)
+                entry = tourney20_state["slots"].pop(slot_num, None)
+                if entry:
+                    target_user_id = entry["manager_id"]
+                    removed_slot_text = f" (Slot #{slot_num} deleted: {entry['team']} [{entry['tag']}])"
+                    await sync_tourney20_board(ctx.guild)
+            except ValueError:
+                pass
+        else:
+            for s, entry in list(tourney20_state["slots"].items()):
+                if entry["manager_id"] == target_user_id:
+                    del tourney20_state["slots"][s]
+                    removed_slot_text = f" (Slot #{s} deleted)"
+                    await sync_tourney20_board(ctx.guild)
+                    break
+
+        _, slot_ch, idpw_ch = get_tourney20_channels(ctx.guild)
+        if target_user_id is not None:
+            m = ctx.guild.get_member(target_user_id) or discord.Object(id=target_user_id)
+            await revoke_view_access(slot_ch, m)
+            await revoke_view_access(idpw_ch, m)
+
+    elif mode_l == "tdm":
+        if target_user_id is None:
+            try:
+                slot_num = int(arg1)
+                entry = tdm_state["slots"].pop(slot_num, None)
+                if entry:
+                    target_user_id = entry["manager_id"]
+                    removed_slot_text = f" (Slot #{slot_num} deleted: {entry['name']})"
+                    await sync_tdm_board(ctx.guild)
+            except ValueError:
+                pass
+        else:
+            for s, entry in list(tdm_state["slots"].items()):
+                if entry["manager_id"] == target_user_id:
+                    del tdm_state["slots"][s]
+                    removed_slot_text = f" (Slot #{s} deleted)"
+                    await sync_tdm_board(ctx.guild)
+                    break
+
+        slot_ch = discord.utils.get(ctx.guild.text_channels, name=TDM_SLOT_CHANNEL)
+        idpw_ch = discord.utils.get(ctx.guild.text_channels, name=TDM_IDPW_CHANNEL)
+        if target_user_id is not None:
+            m = ctx.guild.get_member(target_user_id) or discord.Object(id=target_user_id)
+            await revoke_view_access(slot_ch, m)
+            await revoke_view_access(idpw_ch, m)
+    else:
+        await ctx.send("❌ Usage: `%noshow scrim <16|20|23> <slot>` | `%noshow t20 <slot>` | `%noshow tdm <slot>`")
+        return
+
+    if target_user_id is None:
+        await ctx.send("❌ Could not find a player/slot for that no-show.")
+        return
+
+    res = apply_missed_match_ban(target_user_id)
+    reason_line = (
+        f"Missed match #{res['misses']} -> **{res['duration_text']}**{removed_slot_text}"
+    )
+    await post_ban_log(ctx.guild, log_mode, target_user_id, reason_line, res["permanent"])
+    await ctx.send(f"⚖️ <@{target_user_id}> — {reason_line}")
+
+
+@bot.command(name="unban")
+@commands.has_permissions(manage_channels=True)
+async def unban_cmd(ctx: commands.Context, target: str):
+    if ctx.guild is None:
+        return
+
+    user_id: int | None = ctx.message.mentions[0].id if ctx.message.mentions else None
+    if user_id is None:
+        digits = "".join(c for c in target if c.isdigit())
+        if digits:
+            user_id = int(digits)
+
+    if user_id is None:
+        await ctx.send("❌ Usage: `%unban @user` or `%unban <user_id>`")
+        return
+
+    clear_user_ban(user_id)
+    await ctx.send(f"🔓 <@{user_id}> has been **unbanned** ({UNBAN_FEE_EUR}€ unban processed).")
+
+
+# =========================================================
+# WELCOME / READY / REACTIONS / MESSAGES
+# =========================================================
+@bot.event
+async def on_member_join(member: discord.Member):
+    guild = member.guild
+    channel = None
+
+    if WELCOME_CHANNEL_NAME:
+        channel = discord.utils.get(guild.text_channels, name=WELCOME_CHANNEL_NAME)
+
+    if channel is None and guild.me is not None:
+        for ch in guild.text_channels:
+            perms = ch.permissions_for(guild.me)
+            if perms.view_channel and perms.send_messages:
+                channel = ch
+                break
+
+    if isinstance(channel, discord.TextChannel):
+        try:
+            await channel.send(
+                f"👋 Szia {member.mention}! Üdvözlünk a **{guild.name}** szerveren! "
+                f"Nézd meg a szabályzatot és a scrim / tournament csatornákat, és érezd jól magad!"
+            )
+        except Exception as e:
+            print(f"[ERROR] on_member_join welcome: {e}")
 
 
 @bot.event
 async def on_ready():
     global _view_registered, _schedule_task
+    load_ban_records()
     if not _view_registered:
         bot.add_view(TicketButtonView())
         _view_registered = True
@@ -419,6 +834,9 @@ async def on_ready():
         init_hour_state(h)
     for guild in bot.guilds:
         await sync_tdm_board(guild)
+        await sync_tourney20_board(guild)
+        for h in SCHEDULES:
+            await sync_slot_board(guild, h)
     if _schedule_task is None or _schedule_task.done():
         _schedule_task = bot.loop.create_task(schedule_loop())
     print(f"[OK] Logged in as {bot.user} (ID: {bot.user.id})")
@@ -449,7 +867,6 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if member.bot:
         return
 
-    # Remove user's reaction so the board stays clean
     channel = guild.get_channel(payload.channel_id)
     if isinstance(channel, discord.TextChannel):
         try:
@@ -458,17 +875,10 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         except Exception:
             pass
 
-    # 1) Check TDM slot list message
     if tdm_state.get("slots_msg_id") == payload.message_id:
-        target_slot = None
-        for s, entry in tdm_state["slots"].items():
-            if entry["manager_id"] == member.id:
-                target_slot = s
-                break
-
+        target_slot = next((s for s, e in tdm_state["slots"].items() if e["manager_id"] == member.id), None)
         if target_slot is None:
             return
-
         if emoji == "✅":
             tdm_state["slots"][target_slot]["confirmed"] = True
             await sync_tdm_board(guild)
@@ -481,18 +891,26 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             await revoke_view_access(idpw_ch, member)
         return
 
-    # 2) Check Scrim slot list messages
+    if tourney20_state.get("slots_msg_id") == payload.message_id:
+        target_slot = next((s for s, e in tourney20_state["slots"].items() if e["manager_id"] == member.id), None)
+        if target_slot is None:
+            return
+        if emoji == "✅":
+            tourney20_state["slots"][target_slot]["confirmed"] = True
+            await sync_tourney20_board(guild)
+        elif emoji == "❌":
+            del tourney20_state["slots"][target_slot]
+            await sync_tourney20_board(guild)
+            _, slot_ch, idpw_ch = get_tourney20_channels(guild)
+            await revoke_view_access(slot_ch, member)
+            await revoke_view_access(idpw_ch, member)
+        return
+
     for hour, st in scrim_state.items():
         if st.get("slots_msg_id") == payload.message_id:
-            target_slot = None
-            for s, entry in st["slots"].items():
-                if entry["manager_id"] == member.id:
-                    target_slot = s
-                    break
-
+            target_slot = next((s for s, e in st["slots"].items() if e["manager_id"] == member.id), None)
             if target_slot is None:
                 return
-
             if emoji == "✅":
                 st["slots"][target_slot]["confirmed"] = True
                 await sync_slot_board(guild, hour)
@@ -507,70 +925,84 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot or message.guild is None:
+    if message.author.bot or message.guild is None or not isinstance(message.channel, discord.TextChannel):
         return
 
+    ch_name = message.channel.name
     raw = message.content.strip().lower()
 
-    # Manual open! / close! in #tdm-registration
-    if (
-        isinstance(message.channel, discord.TextChannel)
-        and message.channel.name == TDM_REG_CHANNEL
-        and raw in ("open!", "close!")
-    ):
+    all_reg_channels = {cfg["reg_channel"] for cfg in SCHEDULES.values()} | {
+        TDM_REG_CHANNEL,
+        TOURNAMENT_20_CFG["reg_channel"],
+    }
+
+    if ch_name in all_reg_channels and raw in ("open!", "close!", "reset!"):
         if not isinstance(message.author, discord.Member) or not message.author.guild_permissions.manage_channels:
             await message.add_reaction("❌")
             return
 
-        if raw == "open!":
-            tdm_state["is_open"] = True
-            await set_channel_writable(message.channel, True)
+        if raw == "reset!":
+            if ch_name == TDM_REG_CHANNEL:
+                await reset_tdm(message.guild)
+                await message.add_reaction("✅")
+                await message.channel.send("🔄 **TDM Tournament** has been completely reset.")
+            elif ch_name == TOURNAMENT_20_CFG["reg_channel"]:
+                await reset_tourney20(message.guild)
+                await message.add_reaction("✅")
+                await message.channel.send("🔄 **20:00 Tournament** has been completely reset.")
+            else:
+                hour = parse_hour_from_reg_channel(message.channel)
+                if hour is not None:
+                    await reset_scrim_hour(message.guild, hour)
+                    await message.add_reaction("✅")
+                    await message.channel.send(f"🔄 **{hour:02d}:00 Scrim** has been completely reset.")
+            return
+
+        is_opening = raw == "open!"
+        if ch_name == TDM_REG_CHANNEL:
+            tdm_state["is_open"] = is_opening
+            await set_channel_writable(message.channel, is_opening)
             await sync_tdm_board(message.guild)
-            await message.add_reaction("✅")
-            await message.channel.send("✅ TDM Tournament registration is now **OPEN**.")
+        elif ch_name == TOURNAMENT_20_CFG["reg_channel"]:
+            tourney20_state["manual_open"] = is_opening
+            await set_channel_writable(message.channel, is_opening)
+            await sync_tourney20_board(message.guild)
         else:
-            tdm_state["is_open"] = False
-            await set_channel_writable(message.channel, False)
-            await sync_tdm_board(message.guild)
-            await message.add_reaction("✅")
-            await message.channel.send("🔒 TDM Tournament registration is now **CLOSED**.")
+            hour = parse_hour_from_reg_channel(message.channel)
+            if hour is not None:
+                st = init_hour_state(hour)
+                st["manual_open"] = is_opening
+                await set_channel_writable(message.channel, is_opening)
+
+        await message.add_reaction("✅")
+        if is_opening:
+            await message.channel.send("✅ Registration is now **OPEN**.")
+        else:
+            await message.channel.send("🔒 Registration is now **CLOSED**.")
         return
 
     lines = [line.strip() for line in message.content.splitlines() if line.strip()]
     if lines and lines[0].lower() == "%register":
-        # -------------------------------------------------
-        # A) TDM TOURNAMENT REGISTRATION (#tdm-registration)
-        # Format:
-        # %register
-        # Game Name
-        # @Manager (optional, defaults to author)
-        # -------------------------------------------------
-        if isinstance(message.channel, discord.TextChannel) and message.channel.name == TDM_REG_CHANNEL:
-            if not tdm_state["is_open"]:
-                await message.add_reaction("❌")
-                return
+        manager = message.mentions[0] if message.mentions else message.author
+        ban_info = get_ban_info(manager.id)
+        if ban_info["active"]:
+            await message.add_reaction("❌")
+            await message.reply(f"🚫 Registration blocked: {manager.mention} has an active ban ({ban_info['label']}).")
+            return
 
-            if len(lines) < 2:
+        # A) TDM Tournament registration (40 slots)
+        if ch_name == TDM_REG_CHANNEL:
+            if not tdm_state["is_open"] or len(lines) < 2:
                 await message.add_reaction("❌")
                 return
 
             game_name = lines[1]
-            manager = message.mentions[0] if message.mentions else message.author
-
             for existing in tdm_state["slots"].values():
-                if (
-                    existing["manager_id"] == manager.id
-                    or existing["name"].lower() == game_name.lower()
-                ):
+                if existing["manager_id"] == manager.id or existing["name"].lower() == game_name.lower():
                     await message.add_reaction("❌")
                     return
 
-            assigned_slot = None
-            for s in range(1, TDM_MAX_SLOTS + 1):
-                if s not in tdm_state["slots"]:
-                    assigned_slot = s
-                    break
-
+            assigned_slot = next((s for s in range(1, TDM_MAX_SLOTS + 1) if s not in tdm_state["slots"]), None)
             if assigned_slot is None:
                 await message.add_reaction("❌")
                 return
@@ -593,43 +1025,81 @@ async def on_message(message: discord.Message):
             )
             return
 
-        # -------------------------------------------------
-        # B) SCRIM REGISTRATION (#16-registration / #20 / #23)
-        # -------------------------------------------------
+        # B) 20:00 Tournament registration (no waitlist)
+        if ch_name == TOURNAMENT_20_CFG["reg_channel"]:
+            now_t = datetime.now(TIMEZONE).time()
+            phase = (
+                "reg"
+                if tourney20_state.get("manual_open") is True
+                else None
+                if tourney20_state.get("manual_open") is False
+                else get_phase_from_cfg(TOURNAMENT_20_CFG, now_t)
+            )
+            if phase is None or len(lines) < 3:
+                await message.add_reaction("❌")
+                return
+
+            team_name = lines[1]
+            team_tag = lines[2]
+
+            for existing in tourney20_state["slots"].values():
+                if existing["manager_id"] == manager.id or existing["team"].lower() == team_name.lower():
+                    await message.add_reaction("❌")
+                    return
+
+            _, slot_ch, idpw_ch = get_tourney20_channels(message.guild)
+            vip = is_vip_member(manager)
+            assigned_slot = None
+
+            if phase == "vip" and vip:
+                assigned_slot = next((s for s in [24, 23, 22, 21] if s not in tourney20_state["slots"]), None)
+            elif phase == "reg":
+                order = ([24, 23, 22, 21] + list(range(3, 21))) if vip else list(range(3, 21))
+                assigned_slot = next((s for s in order if s not in tourney20_state["slots"]), None)
+
+            if assigned_slot is None:
+                await message.add_reaction("❌")
+                return
+
+            tourney20_state["slots"][assigned_slot] = {
+                "team": team_name,
+                "tag": team_tag,
+                "manager_id": manager.id,
+                "vip": vip,
+                "confirmed": False,
+            }
+            await sync_tourney20_board(message.guild)
+            await grant_view_access(slot_ch, manager)
+            await grant_view_access(idpw_ch, manager)
+            await message.add_reaction("✅")
+            await message.reply(
+                f"✅ 20:00 Tournament | Slot **#{assigned_slot}** — **{team_name}** [{team_tag}] | Manager: {manager.mention}"
+            )
+            return
+
+        # C) Scrim registration (16 / 20 / 23)
         hour = parse_hour_from_reg_channel(message.channel)
         if hour is None:
             await message.add_reaction("❌")
             return
 
+        st = init_hour_state(hour)
         now_t = datetime.now(TIMEZONE).time()
-        phase = get_active_phase(hour, now_t)
-        if phase is None:
-            await message.add_reaction("❌")
-            return
-
-        if len(lines) < 3:
+        phase = get_active_phase(hour, now_t, st.get("manual_open"))
+        if phase is None or len(lines) < 3:
             await message.add_reaction("❌")
             return
 
         team_name = lines[1]
         team_tag = lines[2]
-        manager = message.mentions[0] if message.mentions else message.author
-
-        st = init_hour_state(hour)
 
         for existing in st["slots"].values():
-            if (
-                existing["manager_id"] == manager.id
-                or existing["team"].lower() == team_name.lower()
-            ):
+            if existing["manager_id"] == manager.id or existing["team"].lower() == team_name.lower():
                 await message.add_reaction("❌")
                 return
 
         for w in st["waitlist"]:
-            if (
-                w["manager_id"] == manager.id
-                or w["team"].lower() == team_name.lower()
-            ):
+            if w["manager_id"] == manager.id or w["team"].lower() == team_name.lower():
                 await message.add_reaction("❌")
                 return
 
@@ -637,25 +1107,11 @@ async def on_message(message: discord.Message):
         vip = is_vip_member(manager)
         assigned_slot = None
 
-        if phase == "vip":
-            if vip:
-                for s in [24, 23, 22, 21]:
-                    if s not in st["slots"]:
-                        assigned_slot = s
-                        break
+        if phase == "vip" and vip:
+            assigned_slot = next((s for s in [24, 23, 22, 21] if s not in st["slots"]), None)
         elif phase == "reg":
-            if vip:
-                for s in [24, 23, 22, 21] + list(range(3, 21)):
-                    if s not in st["slots"]:
-                        assigned_slot = s
-                        break
-            else:
-                for s in range(3, 21):
-                    if s not in st["slots"]:
-                        assigned_slot = s
-                        break
-        elif phase == "waitlist":
-            assigned_slot = None
+            order = ([24, 23, 22, 21] + list(range(3, 21))) if vip else list(range(3, 21))
+            assigned_slot = next((s for s in order if s not in st["slots"]), None)
 
         if assigned_slot is not None:
             st["slots"][assigned_slot] = {
@@ -675,11 +1131,7 @@ async def on_message(message: discord.Message):
             return
 
         st["waitlist"].append(
-            {
-                "team": team_name,
-                "tag": team_tag,
-                "manager_id": manager.id,
-            }
+            {"team": team_name, "tag": team_tag, "manager_id": manager.id}
         )
         await sync_slot_board(message.guild, hour)
         await grant_view_access(wait_ch, manager)
