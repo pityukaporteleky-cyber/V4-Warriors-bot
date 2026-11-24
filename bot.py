@@ -20,14 +20,15 @@ TDM_MAX_SLOTS = 40
 
 TOURNAMENT_20_CFG = {
     "label": "20:00 TOURNAMENT",
-    "slot_channel": "20-tournamnet-slot",
+    "slot_channel": "20-tournament-slot",
     "reg_channel": "20-tournament-registration",
     "wait_channel": None,
-    "idpw_channel": "20-tournamnet-id-pw",
+    "idpw_channel": "20-tournament-id-pw",
     "vip": (time(14, 30), time(14, 55)),
     "reg": (time(15, 0), time(16, 30)),
     "waitlist": (time(19, 20), time(19, 30)),
 }
+
 
 SCRIMS_BAN_CHANNEL = "scrims-ban"
 TOURNAMENT_BAN_CHANNEL = "tournament-ban"
