@@ -447,7 +447,7 @@ PREFIX = "%"
 TDM_REG_CHANNEL = "tdm-registration"
 TDM_SLOT_CHANNEL = "tdm-slot"
 TDM_IDPW_CHANNEL = "tdm-id-pw"
-TDM_MAX_SLOTS = 16
+TDM_MAX_SLOTS = 40
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -456,15 +456,15 @@ intents.members = True
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
 tdm_state = {
-    "slots": {},          # {1..TDM_MAX_SLOTS: {"team": str, "tag": str, "manager_id": int}}
+    "slots": {},          # {1..40: {"team": str, "tag": str, "manager_id": int}}
     "slot_msg_id": None,
-    "is_open": True,
+    "is_open": False,     # Starts closed until you send open!
 }
 
 
 def format_tdm_board() -> str:
     status = "OPEN" if tdm_state["is_open"] else "CLOSED"
-    lines = [f"**TDM TOURNAMENT — SLOT LIST** ({status})", ""]
+    lines = [f"**TDM — SLOT LIST ({status})**", ""]
     for s in range(1, TDM_MAX_SLOTS + 1):
         entry = tdm_state["slots"].get(s)
         if entry:
@@ -537,7 +537,7 @@ async def tdm_reset(ctx: commands.Context):
     tdm_state["slot_msg_id"] = None
     if ctx.guild:
         await sync_tdm_board(ctx.guild)
-    await ctx.send("🔄 TDM slots have been **RESET**.")
+    await ctx.send("🔄 TDM slots reset (1-40).")
 
 
 @bot.event
@@ -563,13 +563,13 @@ async def on_message(message: discord.Message):
             await set_tdm_reg_writable(message.guild, True)
             await sync_tdm_board(message.guild)
             await message.add_reaction("✅")
-            await message.channel.send("✅ TDM registration is now **OPEN**.")
+            await message.channel.send("✅ Registration is now **OPEN**.")
         else:
             tdm_state["is_open"] = False
             await set_tdm_reg_writable(message.guild, False)
             await sync_tdm_board(message.guild)
             await message.add_reaction("✅")
-            await message.channel.send("🔒 TDM registration is now **CLOSED**.")
+            await message.channel.send("🔒 Registration is now **CLOSED**.")
         return
 
     lines = [line.strip() for line in message.content.splitlines() if line.strip()]
@@ -622,7 +622,7 @@ async def on_message(message: discord.Message):
         await grant_view_access(idpw_ch, manager)
         await message.add_reaction("✅")
         await message.reply(
-            f"✅ TDM | Slot **#{assigned_slot}** — **{team_name}** [{team_tag}] | Manager: {manager.mention}"
+            f"✅ Slot **#{assigned_slot}** — **{team_name}** [{team_tag}] | Manager: {manager.mention}"
         )
         return
 
