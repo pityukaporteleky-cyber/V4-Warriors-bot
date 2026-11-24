@@ -436,3 +436,200 @@ if not TOKEN or TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
     raise RuntimeError("Missing bot token: set DISCORD_TOKEN in Railway Variables or replace TOKEN in bot.py.")
 
 bot.run(TOKEN)
+
+import os
+import discord
+from discord.ext import commands
+
+TOKEN = os.getenv("DISCORD_TOKEN", "PASTE_YOUR_BOT_TOKEN_HERE")
+PREFIX = "%"
+
+TDM_REG_CHANNEL = "tdm-registration"
+TDM_SLOT_CHANNEL = "tdm-slot"
+TDM_IDPW_CHANNEL = "tdm-id-pw"
+TDM_MAX_SLOTS = 16
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+
+bot = commands.Bot(command_prefix=PREFIX, intents=intents)
+
+tdm_state = {
+    "slots": {},          # {1..TDM_MAX_SLOTS: {"team": str, "tag": str, "manager_id": int}}
+    "slot_msg_id": None,
+    "is_open": True,
+}
+
+
+def format_tdm_board() -> str:
+    status = "OPEN" if tdm_state["is_open"] else "CLOSED"
+    lines = [f"**TDM TOURNAMENT — SLOT LIST** ({status})", ""]
+    for s in range(1, TDM_MAX_SLOTS + 1):
+        entry = tdm_state["slots"].get(s)
+        if entry:
+            lines.append(
+                f"**Slot {s}:** {entry['team']} [{entry['tag']}] — <@{entry['manager_id']}>"
+            )
+        else:
+            lines.append(f"**Slot {s}:** *Open*")
+    return "\n".join(lines)
+
+
+async def sync_tdm_board(guild: discord.Guild):
+    slot_ch = discord.utils.get(guild.text_channels, name=TDM_SLOT_CHANNEL)
+    if slot_ch is None:
+        return
+
+    content = format_tdm_board()
+    msg_id = tdm_state.get("slot_msg_id")
+
+    try:
+        if msg_id:
+            try:
+                msg = await slot_ch.fetch_message(msg_id)
+                await msg.edit(content=content)
+                return
+            except discord.NotFound:
+                pass
+
+        msg = await slot_ch.send(content=content)
+        tdm_state["slot_msg_id"] = msg.id
+    except discord.Forbidden:
+        print(f"[WARN] Missing send/edit permissions in #{slot_ch.name}")
+    except Exception as e:
+        print(f"[ERROR] sync_tdm_board: {e}")
+
+
+async def set_tdm_reg_writable(guild: discord.Guild, allowed: bool):
+    reg_ch = discord.utils.get(guild.text_channels, name=TDM_REG_CHANNEL)
+    if reg_ch is None or guild.default_role is None:
+        return
+    try:
+        current = reg_ch.overwrites_for(guild.default_role).send_messages
+        if current is not allowed:
+            await reg_ch.set_permissions(guild.default_role, send_messages=allowed)
+    except discord.Forbidden:
+        print(f"[WARN] Missing Manage Permissions in #{reg_ch.name}")
+    except Exception as e:
+        print(f"[ERROR] set_tdm_reg_writable: {e}")
+
+
+async def grant_view_access(channel: discord.TextChannel | None, member: discord.Member):
+    if channel is None:
+        return
+    try:
+        await channel.set_permissions(
+            member,
+            view_channel=True,
+            read_message_history=True,
+        )
+    except discord.Forbidden:
+        print(f"[WARN] Missing Manage Permissions in #{channel.name} for {member}")
+    except Exception as e:
+        print(f"[ERROR] grant_view_access: {e}")
+
+
+@bot.command(name="tdm-reset")
+@commands.has_permissions(manage_channels=True)
+async def tdm_reset(ctx: commands.Context):
+    tdm_state["slots"] = {}
+    tdm_state["slot_msg_id"] = None
+    if ctx.guild:
+        await sync_tdm_board(ctx.guild)
+    await ctx.send("🔄 TDM slots have been **RESET**.")
+
+
+@bot.event
+async def on_ready():
+    print(f"[OK] Logged in as {bot.user} (ID: {bot.user.id})")
+    for guild in bot.guilds:
+        await sync_tdm_board(guild)
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot or message.guild is None:
+        return
+
+    raw = message.content.strip().lower()
+    if raw in ("open!", "close!"):
+        if not isinstance(message.author, discord.Member) or not message.author.guild_permissions.manage_channels:
+            await message.add_reaction("❌")
+            return
+
+        if raw == "open!":
+            tdm_state["is_open"] = True
+            await set_tdm_reg_writable(message.guild, True)
+            await sync_tdm_board(message.guild)
+            await message.add_reaction("✅")
+            await message.channel.send("✅ TDM registration is now **OPEN**.")
+        else:
+            tdm_state["is_open"] = False
+            await set_tdm_reg_writable(message.guild, False)
+            await sync_tdm_board(message.guild)
+            await message.add_reaction("✅")
+            await message.channel.send("🔒 TDM registration is now **CLOSED**.")
+        return
+
+    lines = [line.strip() for line in message.content.splitlines() if line.strip()]
+    if lines and lines[0].lower() == "%register":
+        if not isinstance(message.channel, discord.TextChannel) or message.channel.name != TDM_REG_CHANNEL:
+            await message.add_reaction("❌")
+            return
+
+        if not tdm_state["is_open"]:
+            await message.add_reaction("❌")
+            return
+
+        if len(lines) < 3:
+            await message.add_reaction("❌")
+            return
+
+        team_name = lines[1]
+        team_tag = lines[2]
+        manager = message.mentions[0] if message.mentions else message.author
+
+        for existing in tdm_state["slots"].values():
+            if (
+                existing["manager_id"] == manager.id
+                or existing["team"].lower() == team_name.lower()
+            ):
+                await message.add_reaction("❌")
+                return
+
+        assigned_slot = None
+        for s in range(1, TDM_MAX_SLOTS + 1):
+            if s not in tdm_state["slots"]:
+                assigned_slot = s
+                break
+
+        if assigned_slot is None:
+            await message.add_reaction("❌")
+            return
+
+        tdm_state["slots"][assigned_slot] = {
+            "team": team_name,
+            "tag": team_tag,
+            "manager_id": manager.id,
+        }
+
+        slot_ch = discord.utils.get(message.guild.text_channels, name=TDM_SLOT_CHANNEL)
+        idpw_ch = discord.utils.get(message.guild.text_channels, name=TDM_IDPW_CHANNEL)
+
+        await sync_tdm_board(message.guild)
+        await grant_view_access(slot_ch, manager)
+        await grant_view_access(idpw_ch, manager)
+        await message.add_reaction("✅")
+        await message.reply(
+            f"✅ TDM | Slot **#{assigned_slot}** — **{team_name}** [{team_tag}] | Manager: {manager.mention}"
+        )
+        return
+
+    await bot.process_commands(message)
+
+
+if not TOKEN or TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
+    raise RuntimeError("Missing bot token: set DISCORD_TOKEN in Railway Variables or replace TOKEN in bot.py.")
+
+bot.run(TOKEN)
