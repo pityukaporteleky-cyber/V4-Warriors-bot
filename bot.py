@@ -9,6 +9,11 @@ TOKEN = os.getenv("DISCORD_TOKEN", "PASTE_YOUR_BOT_TOKEN_HERE")
 PREFIX = "%"
 VIP_ROLE_NAME = "Vip_role"
 
+TDM_REG_CHANNEL = "tdm-registration"
+TDM_SLOT_CHANNEL = "tdm-slot"
+TDM_IDPW_CHANNEL = "tdm-id-pw"
+TDM_MAX_SLOTS = 40
+
 
 def get_local_timezone():
     try:
@@ -19,10 +24,6 @@ def get_local_timezone():
 
 TIMEZONE = get_local_timezone()
 
-# Schedules per scrim hour:
-# vip: (open_time, close_time)
-# reg: (open_time, close_time) -> regular registration (slots 3-20)
-# waitlist: (open_time, close_time)
 SCHEDULES = {
     16: {
         "slot_channel": "16-slots",
@@ -56,10 +57,16 @@ SCHEDULES = {
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.reactions = True
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
 scrim_state = {}
+tdm_state = {
+    "slots": {},          # {1..40: {"name": str, "manager_id": int, "confirmed": bool}}
+    "slots_msg_id": None,
+    "is_open": False,
+}
 _view_registered = False
 _schedule_task = None
 
@@ -110,17 +117,17 @@ def get_channels_for_hour(guild: discord.Guild, hour: int):
     return reg_ch, slot_ch, wait_ch, idpw_ch
 
 
-async def set_reg_channel_writable(reg_ch: discord.TextChannel | None, allowed: bool):
-    if reg_ch is None or reg_ch.guild.default_role is None:
+async def set_channel_writable(channel: discord.TextChannel | None, allowed: bool):
+    if channel is None or channel.guild.default_role is None:
         return
     try:
-        current = reg_ch.overwrites_for(reg_ch.guild.default_role).send_messages
+        current = channel.overwrites_for(channel.guild.default_role).send_messages
         if current is not allowed:
-            await reg_ch.set_permissions(reg_ch.guild.default_role, send_messages=allowed)
+            await channel.set_permissions(channel.guild.default_role, send_messages=allowed)
     except discord.Forbidden:
-        print(f"[WARN] Missing Manage Permissions in #{reg_ch.name}")
+        print(f"[WARN] Missing Manage Permissions in #{channel.name}")
     except Exception as e:
-        print(f"[ERROR] set_reg_channel_writable #{reg_ch.name}: {e}")
+        print(f"[ERROR] set_channel_writable #{channel.name}: {e}")
 
 
 async def grant_view_access(channel: discord.TextChannel | None, member: discord.Member):
@@ -138,6 +145,31 @@ async def grant_view_access(channel: discord.TextChannel | None, member: discord
         print(f"[ERROR] grant_view_access #{channel.name}: {e}")
 
 
+async def revoke_view_access(channel: discord.TextChannel | None, member: discord.Member):
+    if channel is None:
+        return
+    try:
+        await channel.set_permissions(member, overwrite=None)
+    except discord.Forbidden:
+        print(f"[WARN] Missing Manage Permissions in #{channel.name} for {member}")
+    except Exception as e:
+        print(f"[ERROR] revoke_view_access #{channel.name}: {e}")
+
+
+async def ensure_board_reactions(msg: discord.Message):
+    try:
+        existing = {str(r.emoji) for r in msg.reactions if r.me}
+        if "✅" not in existing:
+            await msg.add_reaction("✅")
+        if "❌" not in existing:
+            await msg.add_reaction("❌")
+    except Exception as e:
+        print(f"[ERROR] ensure_board_reactions: {e}")
+
+
+# =========================================================
+# SCRIM BOARD (16:00 / 20:00 / 23:00)
+# =========================================================
 def format_slot_board(hour: int) -> str:
     st = init_hour_state(hour)
     lines = [f"**{hour:02d}:00 SCRIM — SLOT LIST**", ""]
@@ -148,9 +180,10 @@ def format_slot_board(hour: int) -> str:
     for s in range(3, 21):
         entry = st["slots"].get(s)
         if entry:
-            lines.append(
-                f"**Slot {s}:** {entry['team']} [{entry['tag']}] — <@{entry['manager_id']}>"
-            )
+            label = f"{entry['team']} [{entry['tag']}]"
+            if entry.get("confirmed"):
+                label = f"__{label}__"
+            lines.append(f"**Slot {s}:** {label} — <@{entry['manager_id']}>")
         else:
             lines.append(f"**Slot {s}:** *Open*")
 
@@ -159,9 +192,10 @@ def format_slot_board(hour: int) -> str:
     for s in [24, 23, 22, 21]:
         entry = st["slots"].get(s)
         if entry:
-            lines.append(
-                f"👑 **Slot {s}:** {entry['team']} [{entry['tag']}] — <@{entry['manager_id']}>"
-            )
+            label = f"{entry['team']} [{entry['tag']}]"
+            if entry.get("confirmed"):
+                label = f"__{label}__"
+            lines.append(f"👑 **Slot {s}:** {label} — <@{entry['manager_id']}>")
         else:
             lines.append(f"👑 **Slot {s}:** *Open (VIP)*")
 
@@ -169,10 +203,10 @@ def format_slot_board(hour: int) -> str:
         lines.append("")
         lines.append("**Wait-list:**")
         for idx, w in enumerate(st["waitlist"], start=1):
-            lines.append(
-                f"{idx}. {w['team']} [{w['tag']}] — <@{w['manager_id']}>"
-            )
+            lines.append(f"{idx}. {w['team']} [{w['tag']}] — <@{w['manager_id']}>")
 
+    lines.append("")
+    lines.append("React ✅ to confirm your slot | React ❌ to cancel your slot.")
     return "\n".join(lines)
 
 
@@ -190,16 +224,64 @@ async def sync_slot_board(guild: discord.Guild, hour: int):
             try:
                 msg = await slot_ch.fetch_message(msg_id)
                 await msg.edit(content=content)
+                await ensure_board_reactions(msg)
                 return
             except discord.NotFound:
                 pass
 
         msg = await slot_ch.send(content=content)
         st["slots_msg_id"] = msg.id
+        await ensure_board_reactions(msg)
     except discord.Forbidden:
         print(f"[WARN] Missing send/edit permissions in #{slot_ch.name}")
     except Exception as e:
         print(f"[ERROR] sync_slot_board #{slot_ch.name}: {e}")
+
+
+# =========================================================
+# TDM TOURNAMENT BOARD (40 SLOTS)
+# =========================================================
+def format_tdm_board() -> str:
+    status = "OPEN" if tdm_state["is_open"] else "CLOSED"
+    lines = [f"**TDM TOURNAMENT — SLOT LIST ({status})**", ""]
+    for s in range(1, TDM_MAX_SLOTS + 1):
+        entry = tdm_state["slots"].get(s)
+        if entry:
+            label = f"__{entry['name']}__" if entry.get("confirmed") else entry["name"]
+            lines.append(f"**Slot {s}:** {label} — <@{entry['manager_id']}>")
+        else:
+            lines.append(f"**Slot {s}:** *Open*")
+
+    lines.append("")
+    lines.append("React ✅ to confirm your slot | React ❌ to cancel your slot.")
+    return "\n".join(lines)
+
+
+async def sync_tdm_board(guild: discord.Guild):
+    slot_ch = discord.utils.get(guild.text_channels, name=TDM_SLOT_CHANNEL)
+    if slot_ch is None:
+        return
+
+    content = format_tdm_board()
+    msg_id = tdm_state.get("slots_msg_id")
+
+    try:
+        if msg_id:
+            try:
+                msg = await slot_ch.fetch_message(msg_id)
+                await msg.edit(content=content)
+                await ensure_board_reactions(msg)
+                return
+            except discord.NotFound:
+                pass
+
+        msg = await slot_ch.send(content=content)
+        tdm_state["slots_msg_id"] = msg.id
+        await ensure_board_reactions(msg)
+    except discord.Forbidden:
+        print(f"[WARN] Missing send/edit permissions in #{slot_ch.name}")
+    except Exception as e:
+        print(f"[ERROR] sync_tdm_board #{slot_ch.name}: {e}")
 
 
 def is_vip_member(member: discord.Member) -> bool:
@@ -228,7 +310,7 @@ async def run_schedule_tick():
                 await sync_slot_board(guild, hour)
 
             phase = get_active_phase(hour, now_t)
-            await set_reg_channel_writable(reg_ch, phase is not None)
+            await set_channel_writable(reg_ch, phase is not None)
 
 
 async def schedule_loop():
@@ -317,6 +399,16 @@ async def ticket_panel(ctx: commands.Context):
     )
 
 
+@bot.command(name="tdm-reset")
+@commands.has_permissions(manage_channels=True)
+async def tdm_reset(ctx: commands.Context):
+    tdm_state["slots"] = {}
+    tdm_state["slots_msg_id"] = None
+    if ctx.guild:
+        await sync_tdm_board(ctx.guild)
+    await ctx.send("🔄 TDM Tournament slots reset (1–40).")
+
+
 @bot.event
 async def on_ready():
     global _view_registered, _schedule_task
@@ -325,9 +417,92 @@ async def on_ready():
         _view_registered = True
     for h in SCHEDULES:
         init_hour_state(h)
+    for guild in bot.guilds:
+        await sync_tdm_board(guild)
     if _schedule_task is None or _schedule_task.done():
         _schedule_task = bot.loop.create_task(schedule_loop())
     print(f"[OK] Logged in as {bot.user} (ID: {bot.user.id})")
+
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    if bot.user is None or payload.user_id == bot.user.id:
+        return
+    if payload.guild_id is None:
+        return
+
+    emoji = str(payload.emoji)
+    if emoji not in ("✅", "❌"):
+        return
+
+    guild = bot.get_guild(payload.guild_id)
+    if guild is None:
+        return
+
+    member = guild.get_member(payload.user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(payload.user_id)
+        except Exception:
+            return
+
+    if member.bot:
+        return
+
+    # Remove user's reaction so the board stays clean
+    channel = guild.get_channel(payload.channel_id)
+    if isinstance(channel, discord.TextChannel):
+        try:
+            msg = await channel.fetch_message(payload.message_id)
+            await msg.remove_reaction(payload.emoji, member)
+        except Exception:
+            pass
+
+    # 1) Check TDM slot list message
+    if tdm_state.get("slots_msg_id") == payload.message_id:
+        target_slot = None
+        for s, entry in tdm_state["slots"].items():
+            if entry["manager_id"] == member.id:
+                target_slot = s
+                break
+
+        if target_slot is None:
+            return
+
+        if emoji == "✅":
+            tdm_state["slots"][target_slot]["confirmed"] = True
+            await sync_tdm_board(guild)
+        elif emoji == "❌":
+            del tdm_state["slots"][target_slot]
+            await sync_tdm_board(guild)
+            slot_ch = discord.utils.get(guild.text_channels, name=TDM_SLOT_CHANNEL)
+            idpw_ch = discord.utils.get(guild.text_channels, name=TDM_IDPW_CHANNEL)
+            await revoke_view_access(slot_ch, member)
+            await revoke_view_access(idpw_ch, member)
+        return
+
+    # 2) Check Scrim slot list messages
+    for hour, st in scrim_state.items():
+        if st.get("slots_msg_id") == payload.message_id:
+            target_slot = None
+            for s, entry in st["slots"].items():
+                if entry["manager_id"] == member.id:
+                    target_slot = s
+                    break
+
+            if target_slot is None:
+                return
+
+            if emoji == "✅":
+                st["slots"][target_slot]["confirmed"] = True
+                await sync_slot_board(guild, hour)
+            elif emoji == "❌":
+                del st["slots"][target_slot]
+                await sync_slot_board(guild, hour)
+                _, slot_ch, _, idpw_ch = get_channels_for_hour(guild, hour)
+                await revoke_view_access(slot_ch, member)
+                await revoke_view_access(idpw_ch, member)
+            return
 
 
 @bot.event
@@ -335,8 +510,92 @@ async def on_message(message: discord.Message):
     if message.author.bot or message.guild is None:
         return
 
+    raw = message.content.strip().lower()
+
+    # Manual open! / close! in #tdm-registration
+    if (
+        isinstance(message.channel, discord.TextChannel)
+        and message.channel.name == TDM_REG_CHANNEL
+        and raw in ("open!", "close!")
+    ):
+        if not isinstance(message.author, discord.Member) or not message.author.guild_permissions.manage_channels:
+            await message.add_reaction("❌")
+            return
+
+        if raw == "open!":
+            tdm_state["is_open"] = True
+            await set_channel_writable(message.channel, True)
+            await sync_tdm_board(message.guild)
+            await message.add_reaction("✅")
+            await message.channel.send("✅ TDM Tournament registration is now **OPEN**.")
+        else:
+            tdm_state["is_open"] = False
+            await set_channel_writable(message.channel, False)
+            await sync_tdm_board(message.guild)
+            await message.add_reaction("✅")
+            await message.channel.send("🔒 TDM Tournament registration is now **CLOSED**.")
+        return
+
     lines = [line.strip() for line in message.content.splitlines() if line.strip()]
     if lines and lines[0].lower() == "%register":
+        # -------------------------------------------------
+        # A) TDM TOURNAMENT REGISTRATION (#tdm-registration)
+        # Format:
+        # %register
+        # Game Name
+        # @Manager (optional, defaults to author)
+        # -------------------------------------------------
+        if isinstance(message.channel, discord.TextChannel) and message.channel.name == TDM_REG_CHANNEL:
+            if not tdm_state["is_open"]:
+                await message.add_reaction("❌")
+                return
+
+            if len(lines) < 2:
+                await message.add_reaction("❌")
+                return
+
+            game_name = lines[1]
+            manager = message.mentions[0] if message.mentions else message.author
+
+            for existing in tdm_state["slots"].values():
+                if (
+                    existing["manager_id"] == manager.id
+                    or existing["name"].lower() == game_name.lower()
+                ):
+                    await message.add_reaction("❌")
+                    return
+
+            assigned_slot = None
+            for s in range(1, TDM_MAX_SLOTS + 1):
+                if s not in tdm_state["slots"]:
+                    assigned_slot = s
+                    break
+
+            if assigned_slot is None:
+                await message.add_reaction("❌")
+                return
+
+            tdm_state["slots"][assigned_slot] = {
+                "name": game_name,
+                "manager_id": manager.id,
+                "confirmed": False,
+            }
+
+            slot_ch = discord.utils.get(message.guild.text_channels, name=TDM_SLOT_CHANNEL)
+            idpw_ch = discord.utils.get(message.guild.text_channels, name=TDM_IDPW_CHANNEL)
+
+            await sync_tdm_board(message.guild)
+            await grant_view_access(slot_ch, manager)
+            await grant_view_access(idpw_ch, manager)
+            await message.add_reaction("✅")
+            await message.reply(
+                f"✅ TDM Tournament | Slot **#{assigned_slot}** — **{game_name}** | Manager: {manager.mention}"
+            )
+            return
+
+        # -------------------------------------------------
+        # B) SCRIM REGISTRATION (#16-registration / #20 / #23)
+        # -------------------------------------------------
         hour = parse_hour_from_reg_channel(message.channel)
         if hour is None:
             await message.add_reaction("❌")
@@ -404,6 +663,7 @@ async def on_message(message: discord.Message):
                 "tag": team_tag,
                 "manager_id": manager.id,
                 "vip": vip,
+                "confirmed": False,
             }
             await sync_slot_board(message.guild, hour)
             await grant_view_access(slot_ch, manager)
@@ -436,4 +696,3 @@ if not TOKEN or TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
     raise RuntimeError("Missing bot token: set DISCORD_TOKEN in Railway Variables or replace TOKEN in bot.py.")
 
 bot.run(TOKEN)
-
