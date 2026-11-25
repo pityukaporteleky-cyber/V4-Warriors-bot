@@ -25,14 +25,12 @@ TDM_MAX_SLOTS = 40
 # 20:00 Tournament channels (matching your server's channel names)
 TOURNAMENT_20_CFG = {
     "label": "20:00 TOURNAMENT",
-    "slot_channel": "20-tournamnet-slot",
-    "reg_channel": "20-tournamnet-registration",
+    "slot_channel": "20-tournament-slot",
+    "reg_channel": "20-tournament-registration",
     "wait_channel": None,
-    "idpw_channel": "20-tournamnet-id-pw",
-    "vip": (time(14, 30), time(14, 55)),
-    "reg": (time(15, 0), time(16, 30)),
-    "waitlist": (time(19, 20), time(19, 30)),
+    "idpw_channel": "20-tournament-id-pw",
 }
+
 
 # Ban log channels and unban fee
 SCRIMS_BAN_CHANNEL = "scrims-ban"
