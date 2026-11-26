@@ -27,8 +27,8 @@ SCHEDULES = {
     16: {
         "label": "16:00 SCRIM",
         "vip": (time(8, 0), time(15, 30)),
-        "reg": (time(15, 30), time(15, 45)),
-        "waitlist": (time(15, 45), time(15, 55)),
+        "reg": (time(10, 0), time(13, 0)),
+        "waitlist": (time(15, 20), time(15, 30)),
         "reg_channel": "16-registration",
         "slot_channel": "16-slots",
         "wait_channel": "16-wait-list",
@@ -38,8 +38,8 @@ SCHEDULES = {
     20: {
         "label": "20:00 SCRIM",
         "vip": (time(8, 0), time(18, 0)),
-        "reg": (time(18, 0), time(19, 20)),
-        "waitlist": (time(19, 20), time(19, 50)),
+        "reg": (time(15, 0), time(18, 0)),
+        "waitlist": (time(19, 20), time(19, 30)),
         "reg_channel": "20-registration",
         "slot_channel": "20-slot",
         "wait_channel": "20-wait-list",
@@ -49,8 +49,8 @@ SCHEDULES = {
     23: {
         "label": "23:00 SCRIM",
         "vip": (time(8, 0), time(18, 0)),
-        "reg": (time(18, 0), time(22, 20)),
-        "waitlist": (time(22, 20), time(22, 50)),
+        "reg": (time(16, 0), time(18, 30)),
+        "waitlist": (time(22, 20), time(22, 30)),
         "reg_channel": "23-registration",
         "slot_channel": "23-slot",
         "wait_channel": "23-wait-list",
@@ -258,42 +258,60 @@ def parse_hour_from_reg_channel(channel: discord.TextChannel) -> int | None:
     return None
 
 
+def get_vip_role(guild: discord.Guild) -> discord.Role | None:
+    return discord.utils.find(
+        lambda r: r.name.lower() == VIP_ROLE_NAME.lower(), guild.roles
+    )
+
+
 def is_vip_member(member: discord.Member) -> bool:
     return any(r.name.lower() == VIP_ROLE_NAME.lower() for r in member.roles)
 
 
 def get_scrim_access_phase(
-    hour: int, member: discord.Member, now_t: time, manual_open: bool | None
+    hour: int, member: discord.Member, now_t: time, st: dict
 ) -> tuple[str | None, str | None]:
+    manual_open = st.get("manual_open")
+    vip = is_vip_member(member)
+
     if manual_open is False:
         return None, f"{hour:02d}:00 scrim registration is closed."
     if manual_open is True:
-        return ("vip" if is_vip_member(member) else "reg"), None
+        return ("vip" if vip else "reg"), None
 
     cfg = SCHEDULES[hour]
-    vip = is_vip_member(member)
-    if is_in_window(now_t, *cfg["vip"]):
-        if vip:
-            return "vip", None
-        return None, f"{hour:02d}:00 VIP window only right now."
-    if is_in_window(now_t, *cfg["reg"]):
+    vip_open = is_in_window(now_t, *cfg["vip"])
+    reg_open = is_in_window(now_t, *cfg["reg"])
+    wait_open = is_in_window(now_t, *cfg["waitlist"]) and len(st.get("waitlist", [])) > 0
+
+    if vip and vip_open:
+        return "vip", None
+    if reg_open:
         return "reg", None
-    if is_in_window(now_t, *cfg["waitlist"]):
+    if vip_open and not vip:
+        return None, f"{hour:02d}:00 VIP window only right now (`{VIP_ROLE_NAME}`)."
+    if wait_open:
         return "waitlist", None
     return None, f"{hour:02d}:00 scrim registration is closed."
 
 
-def describe_scrim_window_state(hour: int, now_t: time, manual_open: bool | None) -> str:
+def describe_scrim_window_state(hour: int, now_t: time, st: dict) -> str:
+    manual_open = st.get("manual_open")
     if manual_open is True:
         return "open"
     if manual_open is False:
         return "closed"
+
     cfg = SCHEDULES[hour]
-    if is_in_window(now_t, *cfg["vip"]):
-        return "vip"
-    if is_in_window(now_t, *cfg["reg"]):
+    vip_open = is_in_window(now_t, *cfg["vip"])
+    reg_open = is_in_window(now_t, *cfg["reg"])
+    wait_open = is_in_window(now_t, *cfg["waitlist"]) and len(st.get("waitlist", [])) > 0
+
+    if reg_open:
         return "reg"
-    if is_in_window(now_t, *cfg["waitlist"]):
+    if vip_open:
+        return "vip"
+    if wait_open:
         return "waitlist"
     return "closed"
 
@@ -313,6 +331,56 @@ async def set_channel_writable(channel: discord.abc.GuildChannel | None, writabl
         await channel.set_permissions(guild.default_role, send_messages=writable)
     except Exception as e:
         print(f"[ERROR] set_channel_writable #{channel.name}: {e}")
+
+
+async def apply_scrim_reg_channel_permissions(
+    channel: discord.abc.GuildChannel | None, state: str
+) -> None:
+    if not isinstance(channel, discord.TextChannel):
+        return
+    guild = channel.guild
+    vip_role = get_vip_role(guild)
+
+    try:
+        if state == "vip":
+            # Csak VIP ranggal rendelkezők látják és írhatnak
+            await channel.set_permissions(
+                guild.default_role,
+                view_channel=False,
+                send_messages=False,
+            )
+            if vip_role is not None:
+                await channel.set_permissions(
+                    vip_role,
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                )
+        elif state in ("reg", "open", "waitlist"):
+            # Mindenki látja és írhat
+            await channel.set_permissions(
+                guild.default_role,
+                view_channel=True,
+                send_messages=True,
+            )
+            if vip_role is not None:
+                await channel.set_permissions(
+                    vip_role,
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                )
+        else:
+            # Zárva: mindenki látja, de senki nem írhat
+            await channel.set_permissions(
+                guild.default_role,
+                view_channel=True,
+                send_messages=False,
+            )
+            if vip_role is not None:
+                await channel.set_permissions(vip_role, overwrite=None)
+    except Exception as e:
+        print(f"[ERROR] apply_scrim_reg_channel_permissions #{channel.name}: {e}")
 
 
 async def grant_view_access(
@@ -386,10 +454,12 @@ async def send_scrim_state_announcement(
 ) -> None:
     label = f"{hour:02d}:00 Scrim"
     fmt_hint = "\nFormat:\n`%register`\n`Team Name`\n`Tag`"
-    if state == "vip":
-        await announce_everyone(
-            reg_ch,
-            f"👑 **{label} VIP registration is OPEN! — {label} VIP regisztráció MEGNYÍLT!**{fmt_hint}",
+    if state == "vip" and isinstance(reg_ch, discord.TextChannel):
+        vip_role = get_vip_role(reg_ch.guild)
+        mention = vip_role.mention if vip_role else f"**{VIP_ROLE_NAME}**"
+        await reg_ch.send(
+            f"👑 {mention} **{label} VIP registration is OPEN! — {label} VIP regisztráció MEGNYÍLT!**{fmt_hint}",
+            allowed_mentions=discord.AllowedMentions(roles=True),
         )
     elif state in ("reg", "open"):
         await announce_everyone(
@@ -731,9 +801,8 @@ async def run_schedule_tick() -> None:
                 st["last_announced_state"] = None
                 await sync_slot_board(guild, hour)
 
-            new_state = describe_scrim_window_state(hour, now_t, st.get("manual_open"))
-            is_open = new_state in ("vip", "reg", "waitlist")
-            await set_channel_writable(reg_ch, is_open)
+            new_state = describe_scrim_window_state(hour, now_t, st)
+            await apply_scrim_reg_channel_permissions(reg_ch, new_state)
 
             if st.get("last_announced_state") != new_state:
                 prev_state = st.get("last_announced_state")
@@ -1232,7 +1301,7 @@ async def on_message(message: discord.Message):
                 st["manual_open"] = is_opening
                 new_st = "open" if is_opening else "closed"
                 st["last_announced_state"] = new_st
-                await set_channel_writable(message.channel, is_opening)
+                await apply_scrim_reg_channel_permissions(message.channel, new_st)
                 await sync_slot_board(message.guild, hour)
                 await message.add_reaction("✅")
                 _, _, wait_ch, _ = get_channels_for_hour(message.guild, hour)
@@ -1340,9 +1409,7 @@ async def on_message(message: discord.Message):
             return
         st = init_hour_state(hour)
         now_t = datetime.now(TIMEZONE).time()
-        phase, deny_reason = get_scrim_access_phase(
-            hour, manager, now_t, st.get("manual_open")
-        )
+        phase, deny_reason = get_scrim_access_phase(hour, manager, now_t, st)
         if phase is None or len(lines) < 3:
             await message.add_reaction("❌")
             if deny_reason:
